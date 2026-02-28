@@ -1,0 +1,22 @@
+--- Predictions Read from outputs/step_by_step_meta-llama_Llama-3.1-8B-Instruct_alg_generated.txt ---
+Successfully parsed predictions for 113 files.
+=======================================
+
+--- Starting Evaluation ---
+Total reference JSON files found in ../Who&When/Algorithm-Generated: 126
+Predictions available for 113 files.
+=======================================
+
+--- Evaluation Summary ---
+Total reference files in data_path: 126
+Predictions parsed from eval file:  113
+Files evaluated (prediction found & actual data read): 113
+Correct Agent Predictions: 45
+Correct Step Predictions:  21
+
+--- Final Accuracy Results ---
+Evaluation File: outputs/step_by_step_meta-llama_Llama-3.1-8B-Instruct_alg_generated.txt
+Data Path:       ../Who&When/Algorithm-Generated
+Agent Accuracy: 35.71%
+Step Accuracy:  16.67%
+(Accuracy calculated based on 126 total files in data path)
