@@ -20,49 +20,35 @@ if torch.cuda.is_available():
 # --- 1. Finite State Space Definitions ---
 
 class AgentRole:
-    CODING_AGENT = "CODING_AGENT"       # Python_Expert, Excel_Expert, DataAnalysis_Expert...
-    VERIFIER_AGENT = "VERIFIER_AGENT"   # Verification_Expert, Validation_Expert...
-    SEARCH_AGENT = "SEARCH_AGENT"       # General Search
-    WEB_SURFER = "WEB_SURFER"           # WebSurfer (browsing, clicking, typing)
-    FILE_SURFER = "FILE_SURFER"         # FileSurfer (local file ops)
-    ORCHESTRATOR = "ORCHESTRATOR"       # Orchestrator (planning, delegating)
-    ASSISTANT = "ASSISTANT"             # Assistant (general purpose)
-    TERMINAL = "TERMINAL"               # Computer_terminal
-    MANAGER_AGENT = "MANAGER_AGENT"     # General Manager (fallback)
+    WORKER = "WORKER"               # Writes Code, Edits Files, Terminal
+    RESEARCHER = "RESEARCHER"       # Search, Web Surfing
+    MANAGER = "MANAGER"             # Orchestrator, Manager
+    VERIFIER = "VERIFIER"           # Verification
+    ASSISTANT = "ASSISTANT"         # General Chat
+    SYSTEM = "SYSTEM"               # Computer Terminal / System Messages
     OTHER = "OTHER"
 
     @classmethod
     def all(cls):
         return [
-            cls.CODING_AGENT, cls.VERIFIER_AGENT, cls.SEARCH_AGENT, 
-            cls.WEB_SURFER, cls.FILE_SURFER, cls.ORCHESTRATOR, cls.ASSISTANT,
-            cls.TERMINAL, cls.MANAGER_AGENT, cls.OTHER
+            cls.WORKER, cls.RESEARCHER, cls.MANAGER, 
+            cls.VERIFIER, cls.ASSISTANT, cls.SYSTEM, cls.OTHER
         ]
 
 class ActionType:
-    WRITE_CODE = "WRITE_CODE"
-    EXEC_SUCCESS = "EXEC_SUCCESS"
-    EXEC_FAIL = "EXEC_FAIL"
-    EXECUTION_OUTPUT = "EXECUTION_OUTPUT" # Output from terminal
-    SEARCH = "SEARCH"
-    BROWSE = "BROWSE"           # Web interaction (click, scroll, type)
-    READ_FILE = "READ_FILE"     # Reading files
-    WRITE_FILE = "WRITE_FILE"   # Writing files
-    VERIFY = "VERIFY"
-    PLAN = "PLAN"
-    THOUGHT = "THOUGHT"         # Internal reasoning / Ledger updates
-    DELEGATE = "DELEGATE"       # Assigning tasks to other agents
-    TERMINATE = "TERMINATE"
-    CHAT = "CHAT" # General conversation
+    MODIFY = "MODIFY"               # Write Code, Write File
+    EXEC_OK = "EXEC_OK"             # Execution Success, Output
+    EXEC_ERR = "EXEC_ERR"           # Execution Failure
+    READ = "READ"                   # Search, Browse, Read File
+    PLAN = "PLAN"                   # Plan, Thought, Delegate, Terminate, Chat
+    VERIFY = "VERIFY"               # Verify
     UNKNOWN = "UNKNOWN"
     
     @classmethod
     def all(cls):
         return [
-            cls.WRITE_CODE, cls.EXEC_SUCCESS, cls.EXEC_FAIL, 
-            cls.SEARCH, cls.BROWSE, cls.READ_FILE, cls.WRITE_FILE,
-            cls.VERIFY, cls.PLAN, cls.THOUGHT, cls.DELEGATE,
-            cls.TERMINATE, cls.CHAT, cls.UNKNOWN
+            cls.MODIFY, cls.EXEC_OK, cls.EXEC_ERR, 
+            cls.READ, cls.PLAN, cls.VERIFY, cls.UNKNOWN
         ]
 
 class TaskType:
@@ -82,7 +68,7 @@ class LLMStateClassifier:
     Replaces brittle if-else heuristics.
     """
     def __init__(self, model_path="meta-llama/Meta-Llama-3.1-8B-Instruct"):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda:1" if torch.cuda.is_available() else "cpu"
         
         # Resolve Model Path (Reuse logic)
         possible_paths = [
@@ -114,7 +100,7 @@ class LLMStateClassifier:
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.eval()
 
-    def classify_state(self, task_context, history_item):
+    def classify_state(self, task_context, history_item, agent_description=""):
         """
         Uses LLM to classify Task, Role, and Action.
         """
@@ -125,6 +111,12 @@ class LLMStateClassifier:
         system_prompt = (
             "You are a specialized classifier for Multi-Agent Systems. "
             "Your job is to categorize the Agent's Role and the Action Type into predefined categories.\n"
+            "Use the Agent Name and specifically the Agent Description (if provided) to determine the functionality.\n"
+            "\n"
+            "DEFINITIONS:\n"
+            "- ROLE: WORKER(Coding/Files), RESEARCHER(Search/Web), MANAGER(Planning), VERIFIER(Review), SYSTEM(Terminal), ASSISTANT(Chat).\n"
+            "- ACTION: MODIFY(Write Code/File), EXEC_OK(Success Output), EXEC_ERR(Error Output), READ(Search/Browse), PLAN(Plan/Chat/Thought), VERIFY(Check).\n"
+            "\n"
             f"Allowed ROLES: {', '.join(AgentRole.all())}\n"
             f"Allowed ACTIONS: {', '.join(ActionType.all())}\n"
             f"Allowed TASK TYPES: {', '.join(TaskType.all())}\n"
@@ -132,9 +124,12 @@ class LLMStateClassifier:
         )
         
         # 2. User Prompt
+        desc_text = f"Agent Description: {agent_description}\n" if agent_description else "Agent Description: N/A\n"
+        
         user_prompt = (
             f"Task: {task_context[:200]}\n"
             f"Agent Name: {agent_name}\n"
+            f"{desc_text}"
             f"Message Content: {content}\n\n"
             "Classify."
         )
@@ -205,7 +200,7 @@ class PreDefinedStateManager:
         self.classifier = classifier
         self.cache = {}
     
-    def extract_state(self, task_context, history_item, has_prior_error=False):
+    def extract_state(self, task_context, history_item, has_prior_error=False, agent_description=""):
         # Create a cache key from content hash + agent
         content_hash = hash(history_item.get('content', ''))
         key = (task_context[:50], history_item.get('name'), content_hash)
@@ -213,7 +208,7 @@ class PreDefinedStateManager:
         if key in self.cache:
             task_type, role, action = self.cache[key]
         else:
-            task_type, role, action = self.classifier.classify_state(task_context, history_item)
+            task_type, role, action = self.classifier.classify_state(task_context, history_item, agent_description=agent_description)
             self.cache[key] = (task_type, role, action)
             
         return (task_type, role, action, has_prior_error)
@@ -222,36 +217,33 @@ class PreDefinedStateManager:
 
 class DiscreteStateMarkov:
     """
-    Builds transition probabilities between Defined States.
-    P(Next_State | Current_State)
-    Also tracks: P(Mistake | Current_State) -> "State Riskiness"
+    Hierarchical Markov Model for Risk Prediction.
+    Levels:
+    1. Full Transition: (Prev_Role, Prev_Action) -> (Curr_Role) [Most Precise]
+    2. Role Transition: (Prev_Role) -> (Curr_Role) [Generalization]
+    3. Base Role Risk: (Curr_Role) [Fallback]
     """
     def __init__(self, classifier):
         self.state_manager = PreDefinedStateManager(classifier)
         
-        # Transitions: state -> next_state -> count
-        self.transitions = defaultdict(Counter)
-        self.transition_mistake_counts = defaultdict(Counter) # (prev, curr) -> count of mistakes
+        # Level 1: Full Transition (Prev_Role, Prev_Action, Prev_Error) -> Curr_Role
+        self.trans_full_counts = defaultdict(Counter)
+        self.trans_full_mistakes = defaultdict(Counter)
         
-        # Mistake Counts: state -> count (how often this state IS the mistake step)
-        self.state_counts = Counter()
+        # Level 2: Role Transition (Prev_Role) -> Curr_Role
+        self.trans_role_counts = defaultdict(Counter)
+        self.trans_role_mistakes = defaultdict(Counter)
         
-        # Start State Stats (Step 0)
-        self.start_role_counts = Counter()
-        self.start_role_success = Counter()
-        self.start_role_failure = Counter()
+        # Level 3: Base Role Risk P(Mistake | Curr_Role)
+        self.base_counts = Counter()
+        self.base_mistakes = Counter()
         
-        # Contrastive Stats
-        self.success_state_counts = Counter() # Times state appears in SUCCESSFUL (or non-mistake) flows
-        self.failure_state_counts = Counter() # Times state appears in FAILED flows (specifically around mistake)
+        # Risk Maps
+        self.risk_map_full = {}
+        self.risk_map_role_trans = {}
+        self.risk_map_base = {}
         
-        # Pre-Action Risk Scores (Role-based, ignoring Action)
-        self.role_risk_scores = {} 
-        self.transition_role_risk_scores = {}
-        self.start_role_risk_scores = {} # Specific for step 0: (Task, Role) -> Risk
-        
-        # Threshold for detection
-        self.optimal_threshold = 0.1 # Default fallback
+        self.optimal_threshold = 0.1 
 
     def optimize_threshold(self, dataset):
         """"
@@ -262,29 +254,38 @@ class DiscreteStateMarkov:
         mistake_scores = []
         
         limit_files = len(dataset)
-        # Use a subset of training data to save time if needed, but here we use all
         for idx in tqdm(range(limit_files)):
             json_data = dataset[idx]
             history = json_data.get('history', [])
             ms = json_data.get('mistake_step', -1)
             mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
             task_context = json_data.get('question', '')
+            system_prompts = json_data.get('system_prompt', {})
             
             prev_state = None
             has_prior_error = False
             
             for i in range(len(history)):
                 curr_msg = history[i]
-                risk, state = self.get_risk(task_context, curr_msg, prev_state, has_prior_error, is_first_step=(i==0))
+                agent_name = curr_msg.get('name', 'Unknown')
+                desc = system_prompts.get(agent_name, "")
+                
+                risk, state = self.get_risk(
+                    task_context, 
+                    curr_msg, 
+                    prev_state, 
+                    has_prior_error, 
+                    is_first_step=(i==0),
+                    agent_description=desc
+                )
                 
                 if i == mistake_step:
                     mistake_scores.append(risk)
                 else:
                     safe_scores.append(risk)
                 
-                # Update context
                 (_, _, action, _) = state
-                if action == ActionType.EXEC_FAIL: has_prior_error = True
+                if action == ActionType.EXEC_ERR: has_prior_error = True
                 prev_state = state
 
         if not mistake_scores:
@@ -293,18 +294,36 @@ class DiscreteStateMarkov:
 
         avg_safe = np.mean(safe_scores) if safe_scores else 0.0
         avg_mistake = np.mean(mistake_scores)
+        std_safe = np.std(safe_scores) if safe_scores else 0.0
         
-        # Simple separation logic: Average of the means
+        # Strategy: The training set has exact transitions (Level 1) yielding high risk,
+        # but the test set often relies on Level 2/3 fallback due to sparsity.
+        # This causes a "Threshold Mismatch" - we must lower the threshold closer to Safe distribution.
         
-        # Strategy 3: Weighted closer to mistake to avoid noise, but ensure we catch peaks
-        self.optimal_threshold = (avg_safe * 0.3 + avg_mistake * 0.7)
+        # We target a threshold that catches anomalies (3-sigma from safe mean)
+        # But limited by the mistake mean to avoid absurdity.
+        
+        # Strategy: Use Percentiles instead of Means.
+        # Goal: Recall > Precision. We want to catch the mistakes.
+        # Set threshold to the 10th percentile of Mistake Scores in training.
+        # This ensures we catch 90% of training mistakes, assuming distribution holds.
+        
+        target_T = np.percentile(mistake_scores, 10)
+        
+        # Safety check: Don't go below 10th percentile of Safe (too much noise)
+        min_T = np.percentile(safe_scores, 10)
+        target_T = max(target_T, min_T)
+        
+        self.optimal_threshold = float(target_T)
         
         print(f"Stats: Avg Safe Risk={avg_safe:.4f}, Avg Mistake Risk={avg_mistake:.4f}")
+        print(f"Selected Optimal Threshold (10th %ile of Mistakes): {self.optimal_threshold:.4f}")
+        
+        print(f"Stats: Avg Safe Risk={avg_safe:.4f} (std={std_safe:.4f}), Avg Mistake Risk={avg_mistake:.4f}")
         print(f"Selected Optimal Threshold: {self.optimal_threshold:.4f}")
 
     def fit(self, dataset):
-        print("Fitting Discrete Markov Chain on Finite predefined states (using LLM Classification)...")
-        
+        print("Fitting Hierarchical Markov Model...")
         limit_files = len(dataset)
         
         for idx in tqdm(range(limit_files)):
@@ -313,168 +332,118 @@ class DiscreteStateMarkov:
             ms = json_data.get('mistake_step', -1)
             mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
             task_context = json_data.get('question', '')
+            sys_prompts = json_data.get('system_prompt', {})
             
             prev_state_tuple = None
             has_prior_error = False
             
             for i in range(len(history)):
                 curr_msg = history[i]
+                agent_name = curr_msg.get('name', 'Unknown')
+                desc = sys_prompts.get(agent_name, "")
                 
-                # Use LLM Classifier via state_manager
                 try:
-                    curr_state_tuple = self.state_manager.extract_state(task_context, curr_msg, has_prior_error)
-                except Exception as e:
-                    print(f"Error extracting state: {e}")
-                    continue
-
-                # Update Counts
-                self.state_counts[curr_state_tuple] += 1
+                    curr_state = self.state_manager.extract_state(task_context, curr_msg, has_prior_error, desc)
+                except: continue
                 
-                # SPECIAL: Track Step 0 separate from general pool
-                if i == 0:
-                    (t, r, a, e) = curr_state_tuple
-                    self.start_role_counts[(t, r)] += 1
-                    if mistake_step == 0:
-                         self.start_role_failure[(t, r)] += 2 # Boost mistake weight
-                    else:
-                         self.start_role_success[(t, r)] += 1
-
-                # Contrastive Logic
-                if mistake_step != -1:
-                    # In a FAILURE trajectory
-                    dist_to_fail = i - mistake_step
-                    # If this state is exactly the mistake or very close to it (e.g. -1, 0)
-                    if -2 <= dist_to_fail <= 0:
-                        self.failure_state_counts[curr_state_tuple] += 2 # Weighted higher
-                    else:
-                        # It appeared in a failed trace but wasn't the cause -> Slight penalty or neutral
-                        self.success_state_counts[curr_state_tuple] += 0.5 
-                else:
-                    # Pure SUCCESS trajectory
-                    self.success_state_counts[curr_state_tuple] += 1
-
+                (c_t, c_r, c_a, c_e) = curr_state
+                # CRITICAL: Include Action in Target Key
+                curr_target_key = (c_t, c_r, c_a)
+                
+                is_mistake = (i == mistake_step)
+                
+                # Update Level 3: Base Role+Action Stats
+                self.base_counts[curr_target_key] += 1
+                if is_mistake: self.base_mistakes[curr_target_key] += 1
+                
                 if prev_state_tuple:
-                    self.transitions[prev_state_tuple][curr_state_tuple] += 1
+                    (p_t, p_r, p_a, p_e) = prev_state_tuple
+                    prev_role_key = (p_t, p_r)
+                    
+                    # Update Level 1: Full Transition -> Role+Action
+                    self.trans_full_counts[prev_state_tuple][curr_target_key] += 1
+                    if is_mistake: self.trans_full_mistakes[prev_state_tuple][curr_target_key] += 1
+                    
+                    # Update Level 2: Role Transition -> Role+Action
+                    self.trans_role_counts[prev_role_key][curr_target_key] += 1
+                    if is_mistake: self.trans_role_mistakes[prev_role_key][curr_target_key] += 1
                 
-                # Mistake Tracking
-                if i == mistake_step:
-                    if prev_state_tuple:
-                        self.transition_mistake_counts[prev_state_tuple][curr_state_tuple] += 1
-                
-                # Update Context for NEXT step
-                (_, _, action, _) = curr_state_tuple
-                if action == ActionType.EXEC_FAIL:
-                    has_prior_error = True
-                
-                prev_state_tuple = curr_state_tuple
-        
+                if c_a == ActionType.EXEC_ERR: has_prior_error = True
+                prev_state_tuple = curr_state
+
         self._compute_risks()
-        
-        # Optimize threshold using training data
         self.optimize_threshold(dataset)
-        
+
     def _compute_risks(self):
-        """
-        Calculates Risk using Contrastive Odds Ratio.
-        Risk(S) = (Count_Fail(S) + alpha) / (Count_Success(S) + Count_Fail(S) + alpha + beta)
-        But specifically boosting states unique to failures.
-        """
-        print("\nComputing State & Transition Risks (Contrastive)...")
+        print("Computing Hierarchical Risks...")
         
-        # 3. Pre-Action Risk (Aggregating over Actions)
-        # We aggregate counts for (Task, Role, *, PriorError)
-        role_success = Counter()
-        role_failure = Counter()
-        role_counts = Counter()
+        # Heuristic: Failures are rare events. We boost their signal significantly.
+        # If even 1 mistake happened, it's a "Risky Zone".
+        FAILURE_BOOST = 2.0
         
-        for state, count in self.state_counts.items():
-            (t, r, a, e) = state
-            role_key = (t, r, e)
-            role_success[role_key] += self.success_state_counts[state]
-            role_failure[role_key] += self.failure_state_counts[state]
-            role_counts[role_key] += count
+        # 1. Base Risks
+        for k, n in self.base_counts.items():
+            m = self.base_mistakes[k]
+            self.risk_map_base[k] = (m * FAILURE_BOOST + 0.1) / (n + 1.0)
             
-        for key, total in role_counts.items():
-            fail_w = role_failure[key]
-            succ_w = role_success[key]
-            risk = (fail_w + 1) / (fail_w + succ_w + 10)
-            if succ_w > 5 * fail_w: risk *= 0.5
-            self.role_risk_scores[key] = risk
-
-        # 4. Pre-Action Transition Risk
-        # (PrevState) -> (Task, Role, *, PriorError)
-        trans_role_mistakes = defaultdict(Counter)
-        trans_role_counts = defaultdict(Counter)
-        
-        for prev_state in self.transitions:
-            for curr_state, count in self.transitions[prev_state].items():
-                (t, r, a, e) = curr_state
-                role_key = (t, r, e)
-                m_count = self.transition_mistake_counts[prev_state][curr_state]
+        # 2. Role Transition Risks
+        for p_key, sub in self.trans_role_counts.items():
+            for c_key, n in sub.items():
+                m = self.trans_role_mistakes[p_key][c_key]
+                self.risk_map_role_trans[(p_key, c_key)] = (m * FAILURE_BOOST + 0.2) / (n + 1.0)
                 
-                trans_role_mistakes[prev_state][role_key] += m_count
-                trans_role_counts[prev_state][role_key] += count
-                
-        for prev_state, next_roles in trans_role_counts.items():
-            for role_key, count in next_roles.items():
-                m_count = trans_role_mistakes[prev_state][role_key]
-                risk = (m_count * 2) / (count + 5)
-                self.transition_role_risk_scores[(prev_state, role_key)] = risk
+        # 3. Full Transition Risks
+        for p_state, sub in self.trans_full_counts.items():
+            for c_key, n in sub.items():
+                m = self.trans_full_mistakes[p_state][c_key]
+                self.risk_map_full[(p_state, c_key)] = (m * FAILURE_BOOST + 0.5) / (n + 1.0)
 
-        # 5. Start State Risk (Step 0 Specific)
-        for role_key, count in self.start_role_counts.items():
-            fail_w = self.start_role_failure[role_key]
-            succ_w = self.start_role_success[role_key]
-
-            # Contrastive Learning Formula (Bayesian Smoothed Odds Ratio)
-            risk = (fail_w + 0.5) / (fail_w + succ_w + 5.0)
-            
-            # Penalize highly successful starts
-            if succ_w > 5 * fail_w:
-                risk *= 0.5
-            
-            self.start_role_risk_scores[role_key] = risk
-
-
-    def get_risk(self, task_context, history_item, prev_state=None, has_prior_error=False, is_first_step=False):
-        """
-        Returns combined risk using only Pre-Action information (Task & Role).
-        Strictly ignores ActionType to prevent information leakage.
-        """
-        # We classify to get the Role, but we MUST ignore the Action for risk lookup
-        state = self.state_manager.extract_state(task_context, history_item, has_prior_error)
-        (task_type, role, action, _) = state
-
-        # Construct the Pre-Action Key: (Task, Role, PriorError)
-        role_key = (task_type, role, has_prior_error)
+    def get_risk(self, task_context, history_item, prev_state=None, has_prior_error=False, is_first_step=False, agent_description=""):
+        state_full = self.state_manager.extract_state(task_context, history_item, has_prior_error, agent_description)
+        (c_t, c_r, c_a, _) = state_full
         
-        # KEY CHANGE: For Step 0, we look at P(Mistake | Task, Role) AT START
-        start_key = (task_type, role)
-
-        if is_first_step:
-            # 1. Use specific Start State Risk if available
-            if start_key in self.start_role_risk_scores:
-                return self.start_role_risk_scores[start_key], state
-            
-            # Fallback if specific start condition unseen: Use global role risk (conservative)
-            base_risk = self.role_risk_scores.get(role_key, 0.0)
-            return base_risk * 0.5, state 
+        # New Target Key: (Role + Action)
+        curr_target_key = (c_t, c_r, c_a)
         
-        # for non-first steps:
-        # Pre-Action Risk = max(Global Role Risk, Transition Role Risk)
+        risks = []
         
-        # 1. Base Pre-Action Risk (Global risk of this Role in this Task)
-        base_risk = self.role_risk_scores.get(role_key, 0.0)
+        # Level 3: Base (Default)
+        r_base = self.risk_map_base.get(curr_target_key, 0.15)
+        risks.append(r_base)
         
-        # 2. Transition Pre-Action Risk (Risk of going from PrevState -> P(Mistake | PresentRole))
-        trans_risk = 0.0
         if prev_state:
-            trans_risk = self.transition_role_risk_scores.get((prev_state, role_key), 0.0)
+            (p_t, p_r, _, _) = prev_state
+            prev_role_key = (p_t, p_r)
+            
+            # Level 2: Role Transition -> Role+Action
+            if (prev_role_key, curr_target_key) in self.risk_map_role_trans:
+                r2 = self.risk_map_role_trans[(prev_role_key, curr_target_key)]
+                risks.append(r2)
+            else:
+                # UNSEEN Transition!
+                # Allow innocent until proven guilty (low default for novel transitions)
+                # This reduces false positives on safe but new actions.
+                risks.append(0.15)
+                
+            # Level 1: Full Transition -> Role+Action (Best Precision)
+            if (prev_state, curr_target_key) in self.risk_map_full:
+                r1 = self.risk_map_full[(prev_state, curr_target_key)]
+                risks.append(r1)
         
-        # Combine
-        total_risk = max(base_risk, trans_risk)
+        # PARANOID STRATEGY: Take the Weighted Max to capture any signal of danger
+        # But we still weight specific (r1) more if it exists?
+        # Actually, Max is robust against dilution.
+        # But we dampen it slightly to avoid single-sample noise.
         
-        return total_risk, state
+        final_risk = max(risks)
+        
+        return final_risk, state_full
+            # Note: We don't penalize missing Level 1 as heavily as missing Level 2,
+            # because "Full State" is naturally sparse. Level 2 miss is a stronger anomaly signal.
+
+        return risk, state_full
+
+        return risk, state_full
 
 # --- 3. Dataset & Evaluation ---
 
@@ -500,7 +469,9 @@ def run_evaluation(markov_model, dataset):
         "total_cases": 0,
         "valid_cases": 0,
         "detected": 0,
-        "early_detection": 0
+        "early_detection": 0,
+        "agent_hit": 0,
+        "detection_with_correct_agent": 0
     }
     
     # We define a detection threshold based on the risk scores we observed during training
@@ -515,6 +486,8 @@ def run_evaluation(markov_model, dataset):
         ms = json_data.get('mistake_step', -1)
         mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
         task_context = json_data.get('question', '')
+        mistake_agent = json_data.get('mistake_agent', 'UNKNOWN')
+        system_prompts = json_data.get('system_prompt', {})
         
         if mistake_step == -1: continue
         
@@ -522,47 +495,73 @@ def run_evaluation(markov_model, dataset):
         stats["valid_cases"] += 1
         
         detected_at = -1
+        detected_agent = None
         outcome = "MISSED"
+        agent_match = False
         
         limit = min(len(history), mistake_step + 5) # Look a bit past to see if we catch it slightly late
         
         prev_state = None
         has_prior_error = False
+        max_observed_risk = 0.0
         
         for i in range(limit):
             curr_msg = history[i]
+            agent_name = curr_msg.get('name', 'UNKNOWN')
+            agent_description = system_prompts.get(agent_name, "")
             
             # 1. Get Risk
-            risk, state = markov_model.get_risk(task_context, curr_msg, prev_state=prev_state, has_prior_error=has_prior_error, is_first_step=(i==0))
+            risk, state = markov_model.get_risk(
+                task_context, 
+                curr_msg, 
+                prev_state=prev_state, 
+                has_prior_error=has_prior_error, 
+                is_first_step=(i==0),
+                agent_description=agent_description
+            )
+            
+            if i == mistake_step:
+                max_observed_risk = risk
             
             # 2. Heuristic Detection Logic
             # If Risk is high, flag it.
             if risk > RISK_THRESHOLD:
                 detected_at = i
+                detected_agent = agent_name
                 break
             
             # Update Context for NEXT step
             (_, _, action, _) = state
-            if action == ActionType.EXEC_FAIL:
+            if action == ActionType.EXEC_ERR:
                 has_prior_error = True
             
             prev_state = state
         
         if detected_at != -1:
+            # Check if detected agent matches the mistake agent
+            agent_match = detected_agent == mistake_agent
+            if agent_match:
+                stats["agent_hit"] += 1
+            
             if detected_at == mistake_step:
                 stats["detected"] += 1
+                if agent_match:
+                    stats["detection_with_correct_agent"] += 1
                 outcome = "EXACT_HIT"
             elif detected_at < mistake_step:
                 stats["early_detection"] += 1
+                if agent_match:
+                    stats["detection_with_correct_agent"] += 1
                 outcome = "EARLY_WARN"
             else:
                 outcome = "LATE_MATCH"
             
             detect_ratios.append(detected_at / len(history))
-            print(f"[ID {idx}] {outcome} @ {detected_at} (Tgt: {mistake_step}) - State: {state}")
+            agent_status = "✓" if agent_match else "✗"
+            print(f"[ID {idx}] {outcome} @ {detected_at} (Tgt: {mistake_step}) Agent: {detected_agent} {agent_status} (Expected: {mistake_agent})")
         else:
             detect_ratios.append(1.0)
-            print(f"[ID {idx}] MISSED {mistake_step}")
+            print(f"[ID {idx}] MISSED {mistake_step} (Risk @ Mistake Step: {max_observed_risk:.4f})")
 
     print("\n=== Final Results ===")
     print(f"Total Valid Cases: {stats['valid_cases']}")
@@ -570,6 +569,8 @@ def run_evaluation(markov_model, dataset):
     print(f"Early Warning: {stats['early_detection']} ({stats['early_detection']/stats['valid_cases']:.2%})")
     combined = stats['detected'] + stats['early_detection']
     print(f"Combined Recall (Exact+Early): {combined/stats['valid_cases']:.2%}")
+    print(f"\nAgent Hit Rate: {stats['agent_hit']} ({stats['agent_hit']/stats['valid_cases']:.2%})")
+    print(f"Detection with Correct Agent: {stats['detection_with_correct_agent']} ({stats['detection_with_correct_agent']/stats['valid_cases']:.2%})")
     print(f"Avg Detection position ratio: {np.mean(detect_ratios):.4f}")
 
 if __name__ == "__main__":

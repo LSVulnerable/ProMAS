@@ -1,131 +1,135 @@
 `torch_dtype` is deprecated! Use `dtype` instead!
-2026-03-01 00:54:49.174335: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
-2026-03-01 00:54:49.180945: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-03-03 20:57:33.083856: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-03-03 20:57:33.090433: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-E0000 00:00:1772297689.187831  223316 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
-E0000 00:00:1772297689.189879  223316 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
-2026-03-01 00:54:49.197539: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+E0000 00:00:1772542653.097468 2820839 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1772542653.099544 2820839 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+2026-03-03 20:57:33.107418: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
 To enable the following instructions: AVX2 AVX_VNNI FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
 Train: 25, Test: 101
 Loading LLM for State Classification from: /home/ls/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659
-Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:00<00:02,  1.02it/s]Loading checkpoint shards:  50%|█████     | 2/4 [00:01<00:01,  1.01it/s]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:02<00:00,  1.01it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.46it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.25it/s]
-Fitting Discrete Markov Chain on Finite predefined states (using LLM Classification)...
-  0%|          | 0/25 [00:00<?, ?it/s]  4%|▍         | 1/25 [00:05<02:15,  5.65s/it]  8%|▊         | 2/25 [00:10<02:04,  5.41s/it] 12%|█▏        | 3/25 [00:17<02:14,  6.10s/it] 16%|█▌        | 4/25 [00:23<02:03,  5.88s/it] 20%|██        | 5/25 [00:26<01:38,  4.91s/it] 24%|██▍       | 6/25 [00:31<01:32,  4.84s/it] 28%|██▊       | 7/25 [00:37<01:35,  5.32s/it] 32%|███▏      | 8/25 [00:43<01:35,  5.60s/it] 36%|███▌      | 9/25 [00:50<01:32,  5.81s/it] 40%|████      | 10/25 [00:52<01:14,  4.93s/it] 44%|████▍     | 11/25 [00:59<01:16,  5.47s/it] 48%|████▊     | 12/25 [01:05<01:12,  5.59s/it] 52%|█████▏    | 13/25 [01:11<01:09,  5.75s/it] 56%|█████▌    | 14/25 [01:18<01:05,  5.98s/it] 60%|██████    | 15/25 [01:22<00:56,  5.62s/it] 64%|██████▍   | 16/25 [01:29<00:53,  5.94s/it] 68%|██████▊   | 17/25 [01:35<00:48,  6.03s/it] 72%|███████▏  | 18/25 [01:40<00:39,  5.71s/it] 76%|███████▌  | 19/25 [01:47<00:35,  5.86s/it] 80%|████████  | 20/25 [01:53<00:30,  6.12s/it] 84%|████████▍ | 21/25 [01:59<00:23,  5.89s/it] 88%|████████▊ | 22/25 [02:06<00:18,  6.19s/it] 92%|█████████▏| 23/25 [02:12<00:12,  6.38s/it] 96%|█████████▌| 24/25 [02:19<00:06,  6.59s/it]100%|██████████| 25/25 [02:26<00:00,  6.61s/it]100%|██████████| 25/25 [02:26<00:00,  5.86s/it]
-
-Computing State & Transition Risks (Contrastive)...
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:00<00:02,  1.22it/s]Loading checkpoint shards:  50%|█████     | 2/4 [00:01<00:01,  1.22it/s]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:02<00:00,  1.23it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:02<00:00,  1.77it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:02<00:00,  1.52it/s]
+Fitting Hierarchical Markov Model...
+  0%|          | 0/25 [00:00<?, ?it/s]  4%|▍         | 1/25 [00:13<05:15, 13.13s/it]  8%|▊         | 2/25 [00:26<05:08, 13.40s/it] 12%|█▏        | 3/25 [00:41<05:09, 14.05s/it] 16%|█▌        | 4/25 [00:52<04:30, 12.90s/it] 20%|██        | 5/25 [00:58<03:23, 10.19s/it] 24%|██▍       | 6/25 [01:07<03:10, 10.01s/it] 28%|██▊       | 7/25 [01:21<03:23, 11.32s/it] 32%|███▏      | 8/25 [01:36<03:31, 12.42s/it] 36%|███▌      | 9/25 [01:49<03:23, 12.73s/it] 40%|████      | 10/25 [01:57<02:47, 11.18s/it] 44%|████▍     | 11/25 [02:11<02:48, 12.05s/it] 48%|████▊     | 12/25 [02:26<02:48, 12.94s/it] 52%|█████▏    | 13/25 [02:34<02:16, 11.38s/it] 56%|█████▌    | 14/25 [02:47<02:11, 11.93s/it] 60%|██████    | 15/25 [02:59<02:00, 12.01s/it] 64%|██████▍   | 16/25 [03:10<01:45, 11.70s/it] 68%|██████▊   | 17/25 [03:25<01:41, 12.69s/it] 72%|███████▏  | 18/25 [03:34<01:21, 11.61s/it] 76%|███████▌  | 19/25 [03:47<01:11, 11.88s/it] 80%|████████  | 20/25 [04:01<01:03, 12.64s/it] 84%|████████▍ | 21/25 [04:11<00:47, 11.84s/it] 88%|████████▊ | 22/25 [04:26<00:38, 12.69s/it] 92%|█████████▏| 23/25 [04:41<00:26, 13.37s/it] 96%|█████████▌| 24/25 [04:54<00:13, 13.22s/it]100%|██████████| 25/25 [05:08<00:00, 13.48s/it]100%|██████████| 25/25 [05:08<00:00, 12.33s/it]
+Computing Hierarchical Risks...
 
 Optimizing Detection Threshold...
-  0%|          | 0/25 [00:00<?, ?it/s]100%|██████████| 25/25 [00:00<00:00, 17896.84it/s]
-Stats: Avg Safe Risk=0.2512, Avg Mistake Risk=0.3958
-Selected Optimal Threshold: 0.3524
+  0%|          | 0/25 [00:00<?, ?it/s]100%|██████████| 25/25 [00:00<00:00, 17220.82it/s]
+Stats: Avg Safe Risk=0.2606, Avg Mistake Risk=0.4583
+Selected Optimal Threshold (10th %ile of Mistakes): 0.2392
+Stats: Avg Safe Risk=0.2606 (std=0.1066), Avg Mistake Risk=0.4583
+Selected Optimal Threshold: 0.2392
 
 --- Running Finite State Risk Evaluation ---
-Using Optimal Risk Threshold: 0.3524
-[ID 0] EXACT_HIT @ 1 (Tgt: 1) - State: ('DATA_ANALYSIS', 'OTHER', 'WRITE_CODE', False)
-[ID 1] EARLY_WARN @ 4 (Tgt: 7) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 2] LATE_MATCH @ 1 (Tgt: 0) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_FAIL', False)
-[ID 3] EXACT_HIT @ 1 (Tgt: 1) - State: ('DATA_ANALYSIS', 'OTHER', 'VERIFY', False)
-[ID 4] EARLY_WARN @ 1 (Tgt: 8) - State: ('DATA_ANALYSIS', 'OTHER', 'PLAN', False)
-[ID 5] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 6] EARLY_WARN @ 1 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 7] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 8] EARLY_WARN @ 1 (Tgt: 5) - State: ('DATA_ANALYSIS', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 9] MISSED 5
-[ID 10] LATE_MATCH @ 2 (Tgt: 1) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'EXEC_FAIL', False)
-[ID 11] MISSED 4
-[ID 12] MISSED 1
-[ID 13] LATE_MATCH @ 1 (Tgt: 0) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_FAIL', False)
-[ID 14] EARLY_WARN @ 4 (Tgt: 5) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 15] EARLY_WARN @ 1 (Tgt: 6) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 16] EARLY_WARN @ 1 (Tgt: 7) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 17] EARLY_WARN @ 0 (Tgt: 4) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 18] EXACT_HIT @ 0 (Tgt: 0) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 19] EARLY_WARN @ 0 (Tgt: 1) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 20] MISSED 6
-[ID 21] LATE_MATCH @ 2 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_SUCCESS', False)
-[ID 22] MISSED 1
-[ID 23] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 24] EARLY_WARN @ 1 (Tgt: 5) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 25] LATE_MATCH @ 2 (Tgt: 0) - State: ('DATA_ANALYSIS', 'OTHER', 'VERIFY', False)
-[ID 26] EARLY_WARN @ 1 (Tgt: 5) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 27] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 28] EXACT_HIT @ 0 (Tgt: 0) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 29] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 30] LATE_MATCH @ 5 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_FAIL', False)
-[ID 31] EARLY_WARN @ 2 (Tgt: 8) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_FAIL', False)
-[ID 32] EARLY_WARN @ 1 (Tgt: 5) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 33] MISSED 3
-[ID 34] EARLY_WARN @ 2 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_SUCCESS', False)
-[ID 35] EARLY_WARN @ 2 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'BROWSE', False)
-[ID 36] MISSED 1
-[ID 37] EARLY_WARN @ 1 (Tgt: 5) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 38] MISSED 5
-[ID 39] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 40] MISSED 1
-[ID 41] EARLY_WARN @ 0 (Tgt: 1) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 42] MISSED 1
-[ID 43] LATE_MATCH @ 6 (Tgt: 2) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'TERMINATE', False)
-[ID 44] LATE_MATCH @ 1 (Tgt: 0) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_SUCCESS', False)
-[ID 45] LATE_MATCH @ 5 (Tgt: 4) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'TERMINATE', False)
-[ID 46] EXACT_HIT @ 0 (Tgt: 0) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'EXEC_FAIL', False)
-[ID 47] MISSED 0
-[ID 48] EARLY_WARN @ 2 (Tgt: 8) - State: ('DATA_ANALYSIS', 'OTHER', 'VERIFY', False)
-[ID 49] LATE_MATCH @ 1 (Tgt: 0) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_SUCCESS', False)
-[ID 50] MISSED 2
-[ID 51] MISSED 8
-[ID 52] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 53] EARLY_WARN @ 1 (Tgt: 7) - State: ('DATA_ANALYSIS', 'OTHER', 'CHAT', False)
-[ID 54] MISSED 1
-[ID 55] EARLY_WARN @ 1 (Tgt: 8) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 56] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 57] LATE_MATCH @ 3 (Tgt: 2) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 58] EXACT_HIT @ 0 (Tgt: 0) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'EXEC_FAIL', False)
-[ID 59] EARLY_WARN @ 1 (Tgt: 4) - State: ('DATA_ANALYSIS', 'OTHER', 'PLAN', False)
-[ID 60] MISSED 2
-[ID 61] EARLY_WARN @ 1 (Tgt: 5) - State: ('DATA_ANALYSIS', 'OTHER', 'PLAN', False)
-[ID 62] EXACT_HIT @ 1 (Tgt: 1) - State: ('DATA_ANALYSIS', 'OTHER', 'SEARCH', False)
-[ID 63] EARLY_WARN @ 1 (Tgt: 5) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 64] LATE_MATCH @ 6 (Tgt: 2) - State: ('DATA_ANALYSIS', 'OTHER', 'UNKNOWN', False)
-[ID 65] EARLY_WARN @ 1 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 66] EARLY_WARN @ 0 (Tgt: 1) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'EXEC_FAIL', False)
-[ID 67] EXACT_HIT @ 8 (Tgt: 8) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 68] EXACT_HIT @ 1 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 69] LATE_MATCH @ 2 (Tgt: 1) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 70] EARLY_WARN @ 2 (Tgt: 8) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'EXEC_FAIL', False)
-[ID 71] MISSED 3
-[ID 72] EXACT_HIT @ 0 (Tgt: 0) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 73] EARLY_WARN @ 2 (Tgt: 8) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 74] EARLY_WARN @ 2 (Tgt: 9) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_FAIL', False)
-[ID 75] MISSED 5
-[ID 76] EXACT_HIT @ 0 (Tgt: 0) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 77] EARLY_WARN @ 1 (Tgt: 3) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 78] EARLY_WARN @ 1 (Tgt: 6) - State: ('DATA_ANALYSIS', 'OTHER', 'SEARCH', False)
-[ID 79] EXACT_HIT @ 1 (Tgt: 1) - State: ('DATA_ANALYSIS', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 80] EARLY_WARN @ 1 (Tgt: 8) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 81] LATE_MATCH @ 7 (Tgt: 4) - State: ('INFO_RETRIEVAL', 'VERIFIER_AGENT', 'BROWSE', True)
-[ID 82] EARLY_WARN @ 1 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 83] MISSED 2
-[ID 84] MISSED 8
-[ID 85] MISSED 1
-[ID 86] EARLY_WARN @ 1 (Tgt: 6) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 87] EXACT_HIT @ 1 (Tgt: 1) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'WRITE_CODE', False)
-[ID 88] MISSED 1
-[ID 89] LATE_MATCH @ 1 (Tgt: 0) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 90] MISSED 2
-[ID 91] EARLY_WARN @ 3 (Tgt: 5) - State: ('DATA_ANALYSIS', 'OTHER', 'VERIFY', False)
-[ID 92] MISSED 1
-[ID 93] EARLY_WARN @ 1 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 94] EARLY_WARN @ 1 (Tgt: 2) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 95] EARLY_WARN @ 5 (Tgt: 7) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_FAIL', False)
-[ID 96] EARLY_WARN @ 1 (Tgt: 2) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
-[ID 97] EARLY_WARN @ 3 (Tgt: 6) - State: ('INFO_RETRIEVAL', 'TERMINAL', 'EXEC_FAIL', False)
-[ID 98] LATE_MATCH @ 2 (Tgt: 1) - State: ('DATA_ANALYSIS', 'CODING_AGENT', 'EXEC_FAIL', False)
-[ID 99] EARLY_WARN @ 1 (Tgt: 3) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'BROWSE', False)
-[ID 100] EARLY_WARN @ 1 (Tgt: 4) - State: ('INFO_RETRIEVAL', 'SEARCH_AGENT', 'SEARCH', False)
+Using Optimal Risk Threshold: 0.2392
+[ID 0] MISSED 1 (Risk @ Mistake Step: 0.1500)
+[ID 1] LATE_MATCH @ 8 (Tgt: 7) Agent: Chess_Expert ✓ (Expected: Chess_Expert)
+[ID 2] MISSED 0 (Risk @ Mistake Step: 0.2392)
+[ID 3] LATE_MATCH @ 3 (Tgt: 1) Agent: Scientific_Verification_Expert ✗ (Expected: GIS_DataAnalysis_Expert)
+[ID 4] EARLY_WARN @ 4 (Tgt: 8) Agent: Computer_terminal ✗ (Expected: DataAnalysis_Expert)
+[ID 5] LATE_MATCH @ 4 (Tgt: 1) Agent: Narration_Expert ✓ (Expected: Narration_Expert)
+[ID 6] MISSED 3 (Risk @ Mistake Step: 0.2392)
+[ID 7] LATE_MATCH @ 2 (Tgt: 1) Agent: DataAnalysis_Expert ✗ (Expected: Data_Collection_Expert)
+[ID 8] MISSED 5 (Risk @ Mistake Step: 0.2392)
+[ID 9] MISSED 5 (Risk @ Mistake Step: 0.2392)
+[ID 10] LATE_MATCH @ 2 (Tgt: 1) Agent: Computer_terminal ✗ (Expected: Statistics_Expert)
+[ID 11] EARLY_WARN @ 2 (Tgt: 4) Agent: Validation_Expert ✗ (Expected: HistoricalWeatherData_Expert)
+[ID 12] EXACT_HIT @ 1 (Tgt: 1) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 13] LATE_MATCH @ 1 (Tgt: 0) Agent: Computer_terminal ✗ (Expected: Library_Database_Expert)
+[ID 14] EARLY_WARN @ 3 (Tgt: 5) Agent: WebServing_Expert ✓ (Expected: WebServing_Expert)
+[ID 15] EARLY_WARN @ 1 (Tgt: 6) Agent: Local_Knowledge_Expert ✗ (Expected: Verification_Expert)
+[ID 16] EARLY_WARN @ 2 (Tgt: 7) Agent: Computer_terminal ✗ (Expected: Reviews_Expert)
+[ID 17] EXACT_HIT @ 4 (Tgt: 4) Agent: Locomotive_Expert ✓ (Expected: Locomotive_Expert)
+[ID 18] MISSED 0 (Risk @ Mistake Step: 0.2392)
+[ID 19] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 20] EARLY_WARN @ 5 (Tgt: 6) Agent: MathAnalysis_Expert ✗ (Expected: Geometry_Expert)
+[ID 21] LATE_MATCH @ 4 (Tgt: 1) Agent: MBTA_FranciscoFoxboroLine_Expert ✗ (Expected: Verification_Expert)
+[ID 22] EARLY_WARN @ 0 (Tgt: 1) Agent: Mesopotamian_Number_Systems_Expert ✓ (Expected: Mesopotamian_Number_Systems_Expert)
+[ID 23] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 24] EARLY_WARN @ 1 (Tgt: 5) Agent: CorporateHistory_IPOs_MondayCom_Expert ✓ (Expected: CorporateHistory_IPOs_MondayCom_Expert)
+[ID 25] MISSED 0 (Risk @ Mistake Step: 0.2392)
+[ID 26] EARLY_WARN @ 1 (Tgt: 5) Agent: AcademicPublication_Expert ✓ (Expected: AcademicPublication_Expert)
+[ID 27] LATE_MATCH @ 2 (Tgt: 1) Agent: Computer_terminal ✗ (Expected: VideoContentAnalysis_Expert)
+[ID 28] MISSED 0 (Risk @ Mistake Step: 0.2392)
+[ID 29] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 30] EARLY_WARN @ 1 (Tgt: 3) Agent: WebServing_Expert ✓ (Expected: WebServing_Expert)
+[ID 31] EARLY_WARN @ 3 (Tgt: 8) Agent: Verification_Expert ✗ (Expected: Vegan_Food_Expert)
+[ID 32] EARLY_WARN @ 1 (Tgt: 5) Agent: Fashion_Vogue_Expert ✗ (Expected: DataVerification_Expert)
+[ID 33] MISSED 3 (Risk @ Mistake Step: 0.2392)
+[ID 34] EARLY_WARN @ 1 (Tgt: 3) Agent: RealityTV_Historian_Expert ✗ (Expected: DataAnalysis_Expert)
+[ID 35] MISSED 3 (Risk @ Mistake Step: 0.2392)
+[ID 36] LATE_MATCH @ 5 (Tgt: 1) Agent: Python_ScikitLearn_StatisticalAnalysis_Expert ✗ (Expected: Verification_Expert)
+[ID 37] EXACT_HIT @ 5 (Tgt: 5) Agent: MartialArts_Expert ✓ (Expected: MartialArts_Expert)
+[ID 38] MISSED 5 (Risk @ Mistake Step: 0.2392)
+[ID 39] LATE_MATCH @ 3 (Tgt: 1) Agent: MarioKart8Deluxe_Expert ✗ (Expected: DataVerification_Expert)
+[ID 40] EARLY_WARN @ 0 (Tgt: 1) Agent: PopulationData_Expert ✗ (Expected: Data_Retrieval_Expert)
+[ID 41] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 42] EXACT_HIT @ 1 (Tgt: 1) Agent: VideoAnalysis_Expert ✓ (Expected: VideoAnalysis_Expert)
+[ID 43] LATE_MATCH @ 5 (Tgt: 2) Agent: Ticket_Pricing_Expert ✗ (Expected: Verification_Expert)
+[ID 44] LATE_MATCH @ 1 (Tgt: 0) Agent: Computer_terminal ✗ (Expected: Geometry_Expert)
+[ID 45] EARLY_WARN @ 3 (Tgt: 4) Agent: FilmCritic_Expert ✓ (Expected: FilmCritic_Expert)
+[ID 46] MISSED 0 (Risk @ Mistake Step: 0.2392)
+[ID 47] LATE_MATCH @ 4 (Tgt: 0) Agent: Python_Expert ✗ (Expected: PythonDebugging_Expert)
+[ID 48] MISSED 8 (Risk @ Mistake Step: 0.2392)
+[ID 49] LATE_MATCH @ 1 (Tgt: 0) Agent: Computer_terminal ✗ (Expected: DataAnalysis_Expert)
+[ID 50] EXACT_HIT @ 2 (Tgt: 2) Agent: Research_Expert ✓ (Expected: Research_Expert)
+[ID 51] EARLY_WARN @ 1 (Tgt: 8) Agent: WebServing_Expert ✓ (Expected: WebServing_Expert)
+[ID 52] EXACT_HIT @ 1 (Tgt: 1) Agent: Literary_Analysis_Expert ✓ (Expected: Literary_Analysis_Expert)
+[ID 53] EARLY_WARN @ 5 (Tgt: 7) Agent: DataManipulation_Expert ✗ (Expected: DataAnalysis_Expert)
+[ID 54] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 55] EARLY_WARN @ 2 (Tgt: 8) Agent: Research_Expert ✓ (Expected: Research_Expert)
+[ID 56] LATE_MATCH @ 4 (Tgt: 1) Agent: Computer_terminal ✗ (Expected: SpeciesSightingsData_Expert)
+[ID 57] EARLY_WARN @ 0 (Tgt: 2) Agent: Movie_Expert ✓ (Expected: Movie_Expert)
+[ID 58] LATE_MATCH @ 1 (Tgt: 0) Agent: Debugging_Expert ✗ (Expected: JSON_Expert)
+[ID 59] EARLY_WARN @ 1 (Tgt: 4) Agent: CelestialPhysics_Expert ✗ (Expected: Marathon_Expert)
+[ID 60] MISSED 2 (Risk @ Mistake Step: 0.2392)
+[ID 61] EXACT_HIT @ 5 (Tgt: 5) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 62] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 63] EARLY_WARN @ 4 (Tgt: 5) Agent: ScientificPaperAnalysis_Expert ✓ (Expected: ScientificPaperAnalysis_Expert)
+[ID 64] EXACT_HIT @ 2 (Tgt: 2) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 65] EARLY_WARN @ 2 (Tgt: 3) Agent: Computer_terminal ✗ (Expected: DataVerification_Expert)
+[ID 66] LATE_MATCH @ 4 (Tgt: 1) Agent: Computer_terminal ✗ (Expected: Debugging_Expert)
+[ID 67] EARLY_WARN @ 2 (Tgt: 8) Agent: WebServing_Expert ✗ (Expected: DataVerification_Expert)
+[ID 68] LATE_MATCH @ 4 (Tgt: 1) Agent: Verification_Expert ✗ (Expected: BiblicalScholar_Expert)
+[ID 69] LATE_MATCH @ 5 (Tgt: 1) Agent: IMDB_Ratings_Expert ✗ (Expected: Filmography_Expert)
+[ID 70] EARLY_WARN @ 3 (Tgt: 8) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 71] EARLY_WARN @ 1 (Tgt: 3) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 72] MISSED 0 (Risk @ Mistake Step: 0.2392)
+[ID 73] EARLY_WARN @ 1 (Tgt: 8) Agent: Computer_terminal ✗ (Expected: AnimalBehavior_Expert)
+[ID 74] EARLY_WARN @ 1 (Tgt: 9) Agent: Literature_Expert ✗ (Expected: Neurology_Expert)
+[ID 75] LATE_MATCH @ 7 (Tgt: 5) Agent: Validation_Expert ✓ (Expected: Validation_Expert)
+[ID 76] MISSED 0 (Risk @ Mistake Step: 0.2392)
+[ID 77] LATE_MATCH @ 5 (Tgt: 3) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 78] EARLY_WARN @ 0 (Tgt: 6) Agent: Latin_American_Music_Expert ✗ (Expected: InformationVerification_Expert)
+[ID 79] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 80] EARLY_WARN @ 2 (Tgt: 8) Agent: Computer_terminal ✗ (Expected: InformationExtraction_Expert)
+[ID 81] EARLY_WARN @ 1 (Tgt: 4) Agent: MerriamWebsterWordOfTheDay_Historian_Expert ✓ (Expected: MerriamWebsterWordOfTheDay_Historian_Expert)
+[ID 82] EARLY_WARN @ 2 (Tgt: 3) Agent: Computer_terminal ✗ (Expected: Paintball_Expert)
+[ID 83] EARLY_WARN @ 1 (Tgt: 2) Agent: Computer_terminal ✗ (Expected: Validation_Expert)
+[ID 84] EARLY_WARN @ 1 (Tgt: 8) Agent: Computer_terminal ✗ (Expected: Blu-Ray_Expert)
+[ID 85] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 86] EARLY_WARN @ 0 (Tgt: 6) Agent: Boggle_Board_Expert ✓ (Expected: Boggle_Board_Expert)
+[ID 87] LATE_MATCH @ 4 (Tgt: 1) Agent: Probability_Expert ✓ (Expected: Probability_Expert)
+[ID 88] LATE_MATCH @ 5 (Tgt: 1) Agent: DemographicData_Expert ✗ (Expected: Verification_Expert)
+[ID 89] LATE_MATCH @ 1 (Tgt: 0) Agent: MusicHistorian_Expert ✗ (Expected: Lyrics_Expert)
+[ID 90] LATE_MATCH @ 4 (Tgt: 2) Agent: Validation_Expert ✗ (Expected: HawaiiRealEstate_Expert)
+[ID 91] EARLY_WARN @ 0 (Tgt: 5) Agent: Baseball_Expert ✗ (Expected: Validation_Expert)
+[ID 92] MISSED 1 (Risk @ Mistake Step: 0.2392)
+[ID 93] EXACT_HIT @ 3 (Tgt: 3) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 94] LATE_MATCH @ 5 (Tgt: 2) Agent: Budgeting_Expert ✗ (Expected: Tickets_Pricing_Expert)
+[ID 95] EARLY_WARN @ 1 (Tgt: 7) Agent: Python_Expert ✗ (Expected: Poetry_Expert)
+[ID 96] EARLY_WARN @ 1 (Tgt: 2) Agent: PolishLanguage_Expert ✗ (Expected: Polish_TV_Series_Expert)
+[ID 97] MISSED 6 (Risk @ Mistake Step: 0.2392)
+[ID 98] LATE_MATCH @ 3 (Tgt: 1) Agent: Verification_Expert ✓ (Expected: Verification_Expert)
+[ID 99] MISSED 3 (Risk @ Mistake Step: 0.2392)
+[ID 100] LATE_MATCH @ 6 (Tgt: 4) Agent: ModelEvaluation_Interpretation_Expert ✓ (Expected: ModelEvaluation_Interpretation_Expert)
 
 === Final Results ===
 Total Valid Cases: 101
-Exact Hit: 21 (20.79%)
-Early Warning: 41 (40.59%)
-Combined Recall (Exact+Early): 61.39%
-Avg Detection position ratio: 0.3754
+Exact Hit: 9 (8.91%)
+Early Warning: 37 (36.63%)
+Combined Recall (Exact+Early): 45.54%
+
+Agent Hit Rate: 30 (29.70%)
+Detection with Correct Agent: 23 (22.77%)
+Avg Detection position ratio: 0.4917
