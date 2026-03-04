@@ -20,36 +20,23 @@ if torch.cuda.is_available():
 # --- 1. Finite State Space Definitions ---
 
 class AgentRole:
-    WORKER = "WORKER"               # Writes Code, Edits Files, Terminal
-    RESEARCHER = "RESEARCHER"       # Search, Web Surfing
-    MANAGER = "MANAGER"             # Orchestrator, Manager
-    VERIFIER = "VERIFIER"           # Verification
-    ASSISTANT = "ASSISTANT"         # General Chat
-    SYSTEM = "SYSTEM"               # Computer Terminal / System Messages
-    OTHER = "OTHER"
+    DOER = "DOER"           # Writes Code, Files, Searches, Browses (High Impact)
+    THINKER = "THINKER"     # Plans, Verifies, Manages, Chats (Mental/Safe)
+    SYSTEM = "SYSTEM"       # Terminal, System Outputs (Passive)
 
     @classmethod
     def all(cls):
-        return [
-            cls.WORKER, cls.RESEARCHER, cls.MANAGER, 
-            cls.VERIFIER, cls.ASSISTANT, cls.SYSTEM, cls.OTHER
-        ]
+        return [cls.DOER, cls.THINKER, cls.SYSTEM]
 
 class ActionType:
-    MODIFY = "MODIFY"               # Write Code, Write File
-    EXEC_OK = "EXEC_OK"             # Execution Success, Output
-    EXEC_ERR = "EXEC_ERR"           # Execution Failure
-    READ = "READ"                   # Search, Browse, Read File
-    PLAN = "PLAN"                   # Plan, Thought, Delegate, Terminate, Chat
-    VERIFY = "VERIFY"               # Verify
-    UNKNOWN = "UNKNOWN"
+    ACT = "ACT"             # Write Code, Search, web-browse, write file
+    TALK = "TALK"           # Plan, Chat, Verify, Thought
+    OK = "OK"               # Execution Success
+    FAIL = "FAIL"           # Execution Failure/Error
     
     @classmethod
     def all(cls):
-        return [
-            cls.MODIFY, cls.EXEC_OK, cls.EXEC_ERR, 
-            cls.READ, cls.PLAN, cls.VERIFY, cls.UNKNOWN
-        ]
+        return [cls.ACT, cls.TALK, cls.OK, cls.FAIL]
 
 class TaskType:
     DATA_ANALYSIS = "DATA_ANALYSIS" 
@@ -68,8 +55,10 @@ class LLMStateClassifier:
     Replaces brittle if-else heuristics.
     """
     def __init__(self, model_path="meta-llama/Meta-Llama-3.1-8B-Instruct"):
-        self.device = "cuda:1" if torch.cuda.is_available() else "cpu"
-        
+        # Use auto device placement to avoid OOM on specific GPUs
+        self.device_map = "auto"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
         # Resolve Model Path (Reuse logic)
         possible_paths = [
             "/home/ls/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots",
@@ -94,47 +83,43 @@ class LLMStateClassifier:
         self.model = AutoModelForCausalLM.from_pretrained(
             resolved_path,
             torch_dtype=torch.float16,
-            device_map=self.device
+            device_map=self.device_map
         )
-        # Fix for "Setting `pad_token_id` to `eos_token_id`" warning
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.eval()
 
     def classify_state(self, task_context, history_item, agent_description=""):
-        """
-        Uses LLM to classify Task, Role, and Action.
-        """
-        content = history_item.get('content', '')[:1000] # Truncate for speed
+        content = history_item.get('content', '')[:1000]
         agent_name = history_item.get('name', history_item.get('role', 'Unknown'))
         
-        # 1. System Prompt
+        # Coarse-grained System Prompt
         system_prompt = (
             "You are a specialized classifier for Multi-Agent Systems. "
-            "Your job is to categorize the Agent's Role and the Action Type into predefined categories.\n"
-            "Use the Agent Name and specifically the Agent Description (if provided) to determine the functionality.\n"
+            "Map the AGENT to one of [DOER, THINKER, SYSTEM] and ACTION to [ACT, TALK, OK, FAIL].\n"
             "\n"
-            "DEFINITIONS:\n"
-            "- ROLE: WORKER(Coding/Files), RESEARCHER(Search/Web), MANAGER(Planning), VERIFIER(Review), SYSTEM(Terminal), ASSISTANT(Chat).\n"
-            "- ACTION: MODIFY(Write Code/File), EXEC_OK(Success Output), EXEC_ERR(Error Output), READ(Search/Browse), PLAN(Plan/Chat/Thought), VERIFY(Check).\n"
+            "GUIDELINES:\n"
+            "1. DOER: Any agent that Writes Code, Edits Files, Browses Web, Searches DB, or performs concrete work.\n"
+            "2. THINKER: Any agent that Plans, Verifies, Critiques, Manages, or Chats.\n"
+            "3. SYSTEM: Computer Terminal, System Logs.\n"
             "\n"
-            f"Allowed ROLES: {', '.join(AgentRole.all())}\n"
-            f"Allowed ACTIONS: {', '.join(ActionType.all())}\n"
-            f"Allowed TASK TYPES: {', '.join(TaskType.all())}\n"
-            "Output JSON format only: {\"role\": \"...\", \"action\": \"...\", \"task\": \"...\"}"
+            "1. ACT: Writing code/files, Searching, Clicking.\n"
+            "2. TALK: Planning, Explanation, Verification, Thoughts.\n"
+            "3. OK: Successful execution logs, Normal outputs.\n"
+            "4. FAIL: Error messages, Exceptions, Stack traces, Failed commands.\n"
+            "\n"
+            "Output JSON format only: {\"role\": \"...\", \"action\": \"...\"}"
         )
         
-        # 2. User Prompt
-        desc_text = f"Agent Description: {agent_description}\n" if agent_description else "Agent Description: N/A\n"
+        desc_text = f"Agent Description: {agent_description}\n" if agent_description else ""
         
         user_prompt = (
-            f"Task: {task_context[:200]}\n"
-            f"Agent Name: {agent_name}\n"
+            f"Context: {task_context[:100]}\n"
+            f"Agent: {agent_name}\n"
             f"{desc_text}"
-            f"Message Content: {content}\n\n"
+            f"Content: {content}\n\n"
             "Classify."
         )
         
-        # Simple prompt construction
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -144,32 +129,23 @@ class LLMStateClassifier:
             messages, 
             add_generation_prompt=True, 
             return_tensors="pt"
-        ).to(self.device)
+        ).to(self.model.device)
 
-        # Create attention mask
         attention_mask = torch.ones_like(input_ids)
         
-        # Ensure pad_token_id is set
-        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids, 
                 attention_mask=attention_mask,
-                pad_token_id=pad_token_id,
-                max_new_tokens=60,
-                do_sample=False, 
-                temperature=None,
-                top_p=None
+                pad_token_id=self.tokenizer.pad_token_id,
+                max_new_tokens=40,
+                do_sample=False
             )
             
         generated_text = self.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
         
-        # Parse JSON
         try:
-            # Simple fuzzy extraction
             json_str = generated_text.replace("```json", "").replace("```", "").strip()
-            # If model chats, try to find the dict
             start = json_str.find("{")
             end = json_str.rfind("}") + 1
             if start != -1 and end != -1:
@@ -179,17 +155,22 @@ class LLMStateClassifier:
         except:
             data = {}
             
-        # Fallback to defaults (using simple heuristics just in case LLM fails)
-        task = data.get("task", TaskType.OTHER)
-        role = data.get("role", AgentRole.OTHER)
-        action = data.get("action", ActionType.UNKNOWN)
+        role = data.get("role", AgentRole.THINKER) # Default safe
+        action = data.get("action", ActionType.TALK)
         
-        # Validate against allowed lists
-        if task not in TaskType.all(): task = TaskType.OTHER
-        if role not in AgentRole.all(): role = AgentRole.OTHER
-        if action not in ActionType.all(): action = ActionType.CHAT
+        # Hard Constraints for Obvious Cases
+        if agent_name == "Computer_terminal" or role == "SYSTEM":
+            role = AgentRole.SYSTEM
+            # Heuristic for fail vs ok if LLM missed it
+            if "Error" in content or "Traceback" in content or "Exception" in content:
+                action = ActionType.FAIL
+            else:
+                action = ActionType.OK
+            
+        if role not in AgentRole.all(): role = AgentRole.THINKER
+        if action not in ActionType.all(): action = ActionType.TALK
         
-        return task, role, action
+        return TaskType.GENERAL_ASSISTANCE, role, action
 
 class PreDefinedStateManager:
     """
@@ -267,7 +248,7 @@ class DiscreteStateMarkov:
             
             for i in range(len(history)):
                 curr_msg = history[i]
-                agent_name = curr_msg.get('name', 'Unknown')
+                agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
                 desc = system_prompts.get(agent_name, "")
                 
                 risk, state = self.get_risk(
@@ -285,7 +266,7 @@ class DiscreteStateMarkov:
                     safe_scores.append(risk)
                 
                 (_, _, action, _) = state
-                if action == ActionType.EXEC_ERR: has_prior_error = True
+                if action == ActionType.FAIL: has_prior_error = True
                 prev_state = state
 
         if not mistake_scores:
@@ -339,7 +320,7 @@ class DiscreteStateMarkov:
             
             for i in range(len(history)):
                 curr_msg = history[i]
-                agent_name = curr_msg.get('name', 'Unknown')
+                agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
                 desc = sys_prompts.get(agent_name, "")
                 
                 try:
@@ -368,7 +349,7 @@ class DiscreteStateMarkov:
                     self.trans_role_counts[prev_role_key][curr_target_key] += 1
                     if is_mistake: self.trans_role_mistakes[prev_role_key][curr_target_key] += 1
                 
-                if c_a == ActionType.EXEC_ERR: has_prior_error = True
+                if c_a == ActionType.FAIL: has_prior_error = True
                 prev_state_tuple = curr_state
 
         self._compute_risks()
@@ -507,7 +488,7 @@ def run_evaluation(markov_model, dataset):
         
         for i in range(limit):
             curr_msg = history[i]
-            agent_name = curr_msg.get('name', 'UNKNOWN')
+            agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
             agent_description = system_prompts.get(agent_name, "")
             
             # 1. Get Risk
@@ -519,7 +500,6 @@ def run_evaluation(markov_model, dataset):
                 is_first_step=(i==0),
                 agent_description=agent_description
             )
-            
             if i == mistake_step:
                 max_observed_risk = risk
             
@@ -532,7 +512,7 @@ def run_evaluation(markov_model, dataset):
             
             # Update Context for NEXT step
             (_, _, action, _) = state
-            if action == ActionType.EXEC_ERR:
+            if action == ActionType.FAIL:
                 has_prior_error = True
             
             prev_state = state
@@ -574,7 +554,8 @@ def run_evaluation(markov_model, dataset):
     print(f"Avg Detection position ratio: {np.mean(detect_ratios):.4f}")
 
 if __name__ == "__main__":
-    data_dir = "Who&When/Algorithm-Generated"
+    # data_dir = "Who&When/Algorithm-Generated"
+    data_dir = "Who&When/Hand-Crafted"
     all_files = glob.glob(os.path.join(data_dir, "*.json"))
     
     # Shuffle
