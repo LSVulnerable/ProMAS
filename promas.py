@@ -251,7 +251,7 @@ class DiscreteStateMarkov:
                 agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
                 desc = system_prompts.get(agent_name, "")
                 
-                risk, state = self.get_risk(
+                risk, state, _ = self.get_risk(
                     task_context, 
                     curr_msg, 
                     prev_state, 
@@ -386,11 +386,11 @@ class DiscreteStateMarkov:
         # New Target Key: (Role + Action)
         curr_target_key = (c_t, c_r, c_a)
         
-        risks = []
+        risks = []  # (risk_value, level)
         
         # Level 3: Base (Default)
         r_base = self.risk_map_base.get(curr_target_key, 0.15)
-        risks.append(r_base)
+        risks.append((r_base, "Level3"))
         
         if prev_state:
             (p_t, p_r, _, _) = prev_state
@@ -399,32 +399,26 @@ class DiscreteStateMarkov:
             # Level 2: Role Transition -> Role+Action
             if (prev_role_key, curr_target_key) in self.risk_map_role_trans:
                 r2 = self.risk_map_role_trans[(prev_role_key, curr_target_key)]
-                risks.append(r2)
+                risks.append((r2, "Level2"))
             else:
                 # UNSEEN Transition!
                 # Allow innocent until proven guilty (low default for novel transitions)
                 # This reduces false positives on safe but new actions.
-                risks.append(0.15)
+                risks.append((0.15, "Level2_Default"))
                 
             # Level 1: Full Transition -> Role+Action (Best Precision)
             if (prev_state, curr_target_key) in self.risk_map_full:
                 r1 = self.risk_map_full[(prev_state, curr_target_key)]
-                risks.append(r1)
+                risks.append((r1, "Level1"))
         
         # PARANOID STRATEGY: Take the Weighted Max to capture any signal of danger
         # But we still weight specific (r1) more if it exists?
         # Actually, Max is robust against dilution.
         # But we dampen it slightly to avoid single-sample noise.
         
-        final_risk = max(risks)
+        final_risk, used_level = max(risks, key=lambda x: x[0])
         
-        return final_risk, state_full
-            # Note: We don't penalize missing Level 1 as heavily as missing Level 2,
-            # because "Full State" is naturally sparse. Level 2 miss is a stronger anomaly signal.
-
-        return risk, state_full
-
-        return risk, state_full
+        return final_risk, state_full, used_level
 
 # --- 3. Dataset & Evaluation ---
 
@@ -455,6 +449,16 @@ def run_evaluation(markov_model, dataset):
         "detection_with_correct_agent": 0
     }
     
+    # Track which risk level was used for detection
+    # Format: {level: (total_count, correct_count)}
+    level_stats = {
+        "Level1": [0, 0],         # [total, correct]
+        "Level2": [0, 0],
+        "Level2_Default": [0, 0],
+        "Level3": [0, 0],
+        "No_Detection": [0, 0]
+    }
+    
     # We define a detection threshold based on the risk scores we observed during training
     # Dynamic threshold from training
     RISK_THRESHOLD = markov_model.optimal_threshold
@@ -477,6 +481,7 @@ def run_evaluation(markov_model, dataset):
         
         detected_at = -1
         detected_agent = None
+        detected_level = None
         outcome = "MISSED"
         agent_match = False
         
@@ -492,7 +497,7 @@ def run_evaluation(markov_model, dataset):
             agent_description = system_prompts.get(agent_name, "")
             
             # 1. Get Risk
-            risk, state = markov_model.get_risk(
+            risk, state, used_level = markov_model.get_risk(
                 task_context, 
                 curr_msg, 
                 prev_state=prev_state, 
@@ -508,6 +513,7 @@ def run_evaluation(markov_model, dataset):
             if risk > RISK_THRESHOLD:
                 detected_at = i
                 detected_agent = agent_name
+                detected_level = used_level
                 break
             
             # Update Context for NEXT step
@@ -528,18 +534,28 @@ def run_evaluation(markov_model, dataset):
                 if agent_match:
                     stats["detection_with_correct_agent"] += 1
                 outcome = "EXACT_HIT"
+                is_correct = True
             elif detected_at < mistake_step:
                 stats["early_detection"] += 1
                 if agent_match:
                     stats["detection_with_correct_agent"] += 1
                 outcome = "EARLY_WARN"
+                is_correct = False
             else:
                 outcome = "LATE_MATCH"
+                is_correct = False
+            
+            # Track which level was used for detection
+            if detected_level and detected_level in level_stats:
+                level_stats[detected_level][0] += 1  # total count
+                if is_correct:
+                    level_stats[detected_level][1] += 1  # correct count
             
             detect_ratios.append(detected_at / len(history))
             agent_status = "✓" if agent_match else "✗"
-            print(f"[ID {idx}] {outcome} @ {detected_at} (Tgt: {mistake_step}) Agent: {detected_agent} {agent_status} (Expected: {mistake_agent})")
+            print(f"[ID {idx}] {outcome} @ {detected_at} (Tgt: {mistake_step}) Agent: {detected_agent} {agent_status} (Expected: {mistake_agent}) [{detected_level}]")
         else:
+            level_stats["No_Detection"][0] += 1  # missed count
             detect_ratios.append(1.0)
             print(f"[ID {idx}] MISSED {mistake_step} (Risk @ Mistake Step: {max_observed_risk:.4f})")
 
@@ -552,16 +568,36 @@ def run_evaluation(markov_model, dataset):
     print(f"\nAgent Hit Rate: {stats['agent_hit']} ({stats['agent_hit']/stats['valid_cases']:.2%})")
     print(f"Detection with Correct Agent: {stats['detection_with_correct_agent']} ({stats['detection_with_correct_agent']/stats['valid_cases']:.2%})")
     print(f"Avg Detection position ratio: {np.mean(detect_ratios):.4f}")
+    
+    # Risk Level Statistics
+    print(f"\n=== Risk Level Usage & Hit Rate Statistics ===")
+    total_detections = combined
+    if total_detections > 0:
+        for level_name in ["Level1", "Level2", "Level2_Default", "Level3"]:
+            total, correct = level_stats[level_name]
+            if total > 0:
+                hit_rate = correct / total
+                usage_pct = total / total_detections
+                label = {
+                    "Level1": "Full Transition",
+                    "Level2": "Role Transition",
+                    "Level2_Default": "Unseen Transition",
+                    "Level3": "Base"
+                }[level_name]
+                print(f"{level_name} ({label}): {total} ({usage_pct:.2%}) detections, Hit Rate: {correct}/{total} ({hit_rate:.2%})")
+    
+    missed_count = level_stats["No_Detection"][0]
+    print(f"\nNo Detection (Missed): {missed_count} ({missed_count/stats['valid_cases']:.2%})")
 
 if __name__ == "__main__":
-    # data_dir = "Who&When/Algorithm-Generated"
-    data_dir = "Who&When/Hand-Crafted"
+    data_dir = "Who&When/Algorithm-Generated"
+    # data_dir = "Who&When/Hand-Crafted"
     all_files = glob.glob(os.path.join(data_dir, "*.json"))
     
     # Shuffle
     random.shuffle(all_files)
     
-    split = int(len(all_files) * 0.2)
+    split = int(len(all_files) * 0.5)
     train_files = all_files[:split]
     test_files = all_files[split:]
     
