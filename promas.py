@@ -20,23 +20,28 @@ if torch.cuda.is_available():
 # --- 1. Finite State Space Definitions ---
 
 class AgentRole:
-    DOER = "DOER"           # Writes Code, Files, Searches, Browses (High Impact)
-    THINKER = "THINKER"     # Plans, Verifies, Manages, Chats (Mental/Safe)
-    SYSTEM = "SYSTEM"       # Terminal, System Outputs (Passive)
+    DOER = "DOER"                 # Concrete work (Code, file, browse)
+    THINKER = "THINKER"           # Deep thinking, verify, critique
+    MANAGER = "MANAGER"           # Orchestrator, dispatching tasks
+    USER_PROXY = "USER_PROXY"     # End user or proxy standing in for user
+    SYSTEM = "SYSTEM"             # Terminal, tool outputs
 
     @classmethod
     def all(cls):
-        return [cls.DOER, cls.THINKER, cls.SYSTEM]
+        return [cls.DOER, cls.THINKER, cls.MANAGER, cls.USER_PROXY, cls.SYSTEM]
 
 class ActionType:
-    ACT = "ACT"             # Write Code, Search, web-browse, write file
-    TALK = "TALK"           # Plan, Chat, Verify, Thought
-    OK = "OK"               # Execution Success
-    FAIL = "FAIL"           # Execution Failure/Error
+    ACT = "ACT"                   # Execute code, read/write files
+    TOOL_CALL = "TOOL_CALL"       # Decide to invoke a tool/agent
+    PLANNING = "PLANNING"         # Step-by-step thinking
+    EVALUATION = "EVALUATION"     # Reviewing other's responses
+    INFORMATION = "INFORMATION"   # Providing raw prompt/info
+    OK = "OK"                     # Success indicator
+    FAIL = "FAIL"                 # Error, generic failure
     
     @classmethod
     def all(cls):
-        return [cls.ACT, cls.TALK, cls.OK, cls.FAIL]
+        return [cls.ACT, cls.TOOL_CALL, cls.PLANNING, cls.EVALUATION, cls.INFORMATION, cls.OK, cls.FAIL]
 
 class TaskType:
     DATA_ANALYSIS = "DATA_ANALYSIS" 
@@ -95,17 +100,23 @@ class LLMStateClassifier:
         # Coarse-grained System Prompt
         system_prompt = (
             "You are a specialized classifier for Multi-Agent Systems. "
-            "Map the AGENT to one of [DOER, THINKER, SYSTEM] and ACTION to [ACT, TALK, OK, FAIL].\n"
+            "Map the AGENT to one of [DOER, THINKER, MANAGER, USER_PROXY, SYSTEM] and ACTION to [ACT, TOOL_CALL, PLANNING, EVALUATION, INFORMATION, OK, FAIL].\n"
             "\n"
-            "GUIDELINES:\n"
-            "1. DOER: Any agent that Writes Code, Edits Files, Browses Web, Searches DB, or performs concrete work.\n"
-            "2. THINKER: Any agent that Plans, Verifies, Critiques, Manages, or Chats.\n"
-            "3. SYSTEM: Computer Terminal, System Logs.\n"
+            "GUIDELINES FOR AGENT ROLE:\n"
+            "1. DOER: Concrete work (Writing Code, File Surfer, Web Surfer).\n"
+            "2. THINKER: Deep thinking, Verification, Critiquing.\n"
+            "3. MANAGER: Orchestrator, dispatching tasks to others.\n"
+            "4. USER_PROXY: The human user or proxy standing in for user.\n"
+            "5. SYSTEM: Computer Terminal, System tool outputs.\n"
             "\n"
-            "1. ACT: Writing code/files, Searching, Clicking.\n"
-            "2. TALK: Planning, Explanation, Verification, Thoughts.\n"
-            "3. OK: Successful execution logs, Normal outputs.\n"
-            "4. FAIL: Error messages, Exceptions, Stack traces, Failed commands.\n"
+            "GUIDELINES FOR ACTION TYPE:\n"
+            "1. ACT: Concrete execution, writing code, reading/writing files.\n"
+            "2. TOOL_CALL: Deciding to invoke a tool or delegate to another agent.\n"
+            "3. PLANNING: Step-by-step thinking, deciding what to do next.\n"
+            "4. EVALUATION: Reviewing other's responses, verifying correctness.\n"
+            "5. INFORMATION: Just providing raw prompts, simple chat, or info.\n"
+            "6. OK: Explicit success indicator.\n"
+            "7. FAIL: Error messages, Exceptions, Stack traces.\n"
             "\n"
             "Output JSON format only: {\"role\": \"...\", \"action\": \"...\"}"
         )
@@ -156,7 +167,7 @@ class LLMStateClassifier:
             data = {}
             
         role = data.get("role", AgentRole.THINKER) # Default safe
-        action = data.get("action", ActionType.TALK)
+        action = data.get("action", ActionType.INFORMATION)
         
         # Hard Constraints for Obvious Cases
         if agent_name == "Computer_terminal" or role == "SYSTEM":
@@ -166,9 +177,15 @@ class LLMStateClassifier:
                 action = ActionType.FAIL
             else:
                 action = ActionType.OK
+                
+        if agent_name.lower() in ["human", "user"]:
+            role = AgentRole.USER_PROXY
+            
+        if "Orchestrator" in agent_name:
+            role = AgentRole.MANAGER
             
         if role not in AgentRole.all(): role = AgentRole.THINKER
-        if action not in ActionType.all(): action = ActionType.TALK
+        if action not in ActionType.all(): action = ActionType.INFORMATION
         
         return TaskType.GENERAL_ASSISTANCE, role, action
 
@@ -795,14 +812,14 @@ def run_evaluation(markov_model, dataset):
 
 
 if __name__ == "__main__":
-    # data_dir = "Who&When/Algorithm-Generated"
-    data_dir = "Who&When/Hand-Crafted"
+    data_dir = "Who&When/Algorithm-Generated"
+    # data_dir = "Who&When/Hand-Crafted"
     all_files = glob.glob(os.path.join(data_dir, "*.json"))
     
     # Shuffle
     random.shuffle(all_files)
     
-    split = int(len(all_files) * 0.4)
+    split = int(len(all_files) * 0.2)
     train_files = all_files[:split]
     test_files = all_files[split:]
     
