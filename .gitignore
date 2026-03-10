@@ -1,2 +1,4 @@
 src/*
 *.log
+analyze_mistakes_batch.py
+split_mmlu.py

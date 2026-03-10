@@ -94,7 +94,15 @@ class LLMStateClassifier:
         self.model.eval()
 
     def classify_state(self, task_context, history_item, agent_description=""):
-        content = history_item.get('content', '')[:1000]
+        # Handle dict or string task_context (humaneval has dict, others have string)
+        if isinstance(task_context, dict):
+            task_context_str = task_context.get('prompt', str(task_context))
+        else:
+            task_context_str = str(task_context)
+        
+        content = history_item.get('content', '') or ''  # Handle None values
+        if content:
+            content = content[:1000]
         agent_name = history_item.get('name', history_item.get('role', 'Unknown'))
         
         # Coarse-grained System Prompt
@@ -124,7 +132,7 @@ class LLMStateClassifier:
         desc_text = f"Agent Description: {agent_description}\n" if agent_description else ""
         
         user_prompt = (
-            f"Context: {task_context[:100]}\n"
+            f"Context: {task_context_str[:100]}\n"
             f"Agent: {agent_name}\n"
             f"{desc_text}"
             f"Content: {content}\n\n"
@@ -200,8 +208,14 @@ class PreDefinedStateManager:
     
     def extract_state(self, task_context, history_item, has_prior_error=False, agent_description=""):
         # Create a cache key from content hash + agent
+        # Ensure task_context is a string (humaneval may have dict, others have string)
+        if isinstance(task_context, dict):
+            task_context_str = task_context.get('prompt', str(task_context))
+        else:
+            task_context_str = str(task_context)
+        
         content_hash = hash(history_item.get('content', ''))
-        key = (task_context[:50], history_item.get('name'), content_hash)
+        key = (task_context_str[:50], history_item.get('name'), content_hash)
         
         if key in self.cache:
             task_type, role, action = self.cache[key]
@@ -812,11 +826,32 @@ def run_evaluation(markov_model, dataset):
 
 
 if __name__ == "__main__":
-    data_dir = "Who&When/Algorithm-Generated"
-    # data_dir = "Who&When/Hand-Crafted"
-    all_files = glob.glob(os.path.join(data_dir, "*.json"))
+    datasets_dirs = [
+        #"Who&When/Algorithm-Generated",
+        #"Who&When/Hand-Crafted",
+        "datasets/mmlu",
+        "datasets/aqua",
+        "datasets/humaneval"
+    ]
     
-    # Shuffle
+    all_files = []
+    dataset_counts = {}
+    
+    for data_dir in datasets_dirs:
+        if os.path.exists(data_dir):
+            files = glob.glob(os.path.join(data_dir, "*.json"))
+            # Skip empty files
+            valid_files = [f for f in files if os.path.getsize(f) > 0]
+            all_files.extend(valid_files)
+            dataset_counts[data_dir] = len(valid_files)
+            print(f"Loaded {len(valid_files)} files from {data_dir}")
+        else:
+            print(f"Warning: Directory {data_dir} not found")
+    
+    print(f"\nTotal files from all datasets: {len(all_files)}")
+    print(f"Dataset breakdown: {dataset_counts}\n")
+    
+    # Shuffle combined dataset
     random.shuffle(all_files)
     
     split = int(len(all_files) * 0.2)
