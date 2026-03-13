@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from sentence_transformers import SentenceTransformer
 import numpy as np
 import json
 import os
@@ -223,7 +225,28 @@ class PreDefinedStateManager:
             task_type, role, action = self.classifier.classify_state(task_context, history_item, agent_description=agent_description)
             self.cache[key] = (task_type, role, action)
             
-        return (task_type, role, action, has_prior_error)
+        content_text = history_item.get('content', '') or ''
+        return (task_type, role, action, has_prior_error, content_text)
+
+class TextFeatureExtractor:
+    """
+    Encodes message content into dense semantic vectors for risk modeling.
+    """
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.encoder = SentenceTransformer(model_name, device=self.device)
+        self.dim = self.encoder.get_sentence_embedding_dimension()
+        self.cache = {}
+
+    def encode(self, text):
+        if text is None:
+            text = ""
+        text = str(text).strip()
+        if text in self.cache:
+            return self.cache[text]
+        vec = self.encoder.encode(text, normalize_embeddings=True)
+        self.cache[text] = vec
+        return vec
 
 # --- 2. Neural Risk Model with Contrastive Learning ---
 
@@ -231,7 +254,7 @@ class NeuralRiskModel(nn.Module):
     """
     Uses Context and Auxiliary Task (Predicting Action) to learn risk scoring.
     """
-    def __init__(self, hidden_dim=64):
+    def __init__(self, hidden_dim=128, text_dim=384, dropout=0.2, focal_alpha=0.75, focal_gamma=2.0):
         super().__init__()
         
         self.task_types = {t: i for i, t in enumerate(TaskType.all())}
@@ -241,21 +264,26 @@ class NeuralRiskModel(nn.Module):
         self.task_emb = nn.Embedding(len(self.task_types), 16)
         self.role_emb = nn.Embedding(len(self.roles), 16)
         self.action_emb = nn.Embedding(len(self.actions), 16)
+        self.text_dim = text_dim
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
         
         # prev encoded WITH action (Task, Role, PrevAction)
-        prev_dim = 16 * 3  
+        prev_dim = (16 * 3) + self.text_dim
         self.prev_encoder = nn.Sequential(
             nn.Linear(prev_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
         
         # curr encoded WITHOUT action (Task, Role)
-        curr_dim = 16 * 2  
+        curr_dim = (16 * 2) + self.text_dim
         self.curr_encoder = nn.Sequential(
             nn.Linear(curr_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
@@ -277,8 +305,17 @@ class NeuralRiskModel(nn.Module):
         
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.to(self.device)
+
+    def _to_text_tensor(self, text_vector):
+        vec = np.asarray(text_vector, dtype=np.float32).flatten()
+        if vec.shape[0] != self.text_dim:
+            fixed = np.zeros((self.text_dim,), dtype=np.float32)
+            copy_len = min(self.text_dim, vec.shape[0])
+            fixed[:copy_len] = vec[:copy_len]
+            vec = fixed
+        return torch.tensor(vec, dtype=torch.float32, device=self.device).unsqueeze(0)
     
-    def encode_prev_state(self, state_tuple):
+    def encode_prev_state(self, state_tuple, text_vector):
         task_type, role, action = state_tuple
         
         task_idx = self.task_types.get(task_type, 0)
@@ -288,11 +325,11 @@ class NeuralRiskModel(nn.Module):
         task_t = torch.tensor([task_idx], dtype=torch.long, device=self.device)
         role_t = torch.tensor([role_idx], dtype=torch.long, device=self.device)
         action_t = torch.tensor([action_idx], dtype=torch.long, device=self.device)
-        
-        state_emb = torch.cat([self.task_emb(task_t), self.role_emb(role_t), self.action_emb(action_t)], dim=1)
+        text_t = self._to_text_tensor(text_vector)
+        state_emb = torch.cat([self.task_emb(task_t), self.role_emb(role_t), self.action_emb(action_t), text_t], dim=1)
         return state_emb
 
-    def encode_curr_state(self, state_tuple):
+    def encode_curr_state(self, state_tuple, text_vector):
         task_type, role = state_tuple
         
         task_idx = self.task_types.get(task_type, 0)
@@ -300,13 +337,13 @@ class NeuralRiskModel(nn.Module):
         
         task_t = torch.tensor([task_idx], dtype=torch.long, device=self.device)
         role_t = torch.tensor([role_idx], dtype=torch.long, device=self.device)
-        
-        state_emb = torch.cat([self.task_emb(task_t), self.role_emb(role_t)], dim=1)
+        text_t = self._to_text_tensor(text_vector)
+        state_emb = torch.cat([self.task_emb(task_t), self.role_emb(role_t), text_t], dim=1)
         return state_emb
     
-    def forward(self, prev_state, curr_state):
-        prev_emb = self.encode_prev_state(prev_state)  
-        curr_emb = self.encode_curr_state(curr_state)  
+    def forward(self, prev_state, curr_state, prev_text, curr_text):
+        prev_emb = self.encode_prev_state(prev_state, prev_text)
+        curr_emb = self.encode_curr_state(curr_state, curr_text)
         
         prev_encoded = self.prev_encoder(prev_emb)  
         curr_encoded = self.curr_encoder(curr_emb)  
@@ -318,11 +355,21 @@ class NeuralRiskModel(nn.Module):
         
         return risk.squeeze().item(), action_logits
     
-    def compute_loss(self, prev_states, curr_states, labels, target_actions):
+    def focal_bce_loss(self, probs, labels, sample_weights=None):
+        probs = torch.clamp(probs, 1e-6, 1 - 1e-6)
+        bce = F.binary_cross_entropy(probs, labels, reduction='none')
+        pt = torch.where(labels == 1, probs, 1 - probs)
+        alpha_t = torch.where(labels == 1, self.focal_alpha, 1 - self.focal_alpha)
+        focal = alpha_t * ((1 - pt) ** self.focal_gamma) * bce
+        if sample_weights is not None:
+            focal = focal * sample_weights
+        return focal.mean()
+
+    def compute_loss(self, prev_states, curr_states, prev_texts, curr_texts, labels, target_actions, sample_weights=None):
         risks, action_preds = [], []
-        for p_state, c_state in zip(prev_states, curr_states):
-            prev_emb = self.encode_prev_state(p_state)
-            curr_emb = self.encode_curr_state(c_state)
+        for p_state, c_state, p_txt, c_txt in zip(prev_states, curr_states, prev_texts, curr_texts):
+            prev_emb = self.encode_prev_state(p_state, p_txt)
+            curr_emb = self.encode_curr_state(c_state, c_txt)
             
             combined = torch.cat([self.prev_encoder(prev_emb), self.curr_encoder(curr_emb)], dim=1)
             risks.append(self.risk_head(combined))
@@ -334,9 +381,12 @@ class NeuralRiskModel(nn.Module):
         
         target_action_idx = [self.actions.get(a, 0) for a in target_actions]
         target_actions_t = torch.tensor(target_action_idx, dtype=torch.long, device=self.device)
+        sample_weights_t = None
+        if sample_weights is not None:
+            sample_weights_t = torch.tensor(sample_weights, dtype=torch.float32, device=self.device)
         
         # Loss 1: BCE for Risk
-        loss_risk = nn.BCELoss()(risks, labels_t)
+        loss_risk = self.focal_bce_loss(risks, labels_t, sample_weights=sample_weights_t)
         # Loss 2: CrossEntropy for Action Prediction (Auxiliary task)
         loss_action = nn.CrossEntropyLoss()(action_preds, target_actions_t)
         
@@ -347,40 +397,52 @@ class InitialRiskModel(nn.Module):
     """
     Learns risk for the very first step based on (TaskType, AgentRole).
     """
-    def __init__(self, hidden_dim=32):
+    def __init__(self, hidden_dim=64, text_dim=384, dropout=0.2):
         super().__init__()
         self.task_types = {t: i for i, t in enumerate(TaskType.all())}
         self.roles = {r: i for i, r in enumerate(AgentRole.all())}
         
         self.task_emb = nn.Embedding(len(self.task_types), 16)
         self.role_emb = nn.Embedding(len(self.roles), 16)
+        self.text_dim = text_dim
         
-        state_dim = 16 * 2
+        state_dim = (16 * 2) + self.text_dim
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.to(self.device)
         
-    def encode_states(self, states):
+    def encode_states(self, states, text_vectors):
         t_idx = [self.task_types.get(s[0], 0) for s in states]
         r_idx = [self.roles.get(s[1], 0) for s in states]
         
         t_t = torch.tensor(t_idx, dtype=torch.long, device=self.device)
         r_t = torch.tensor(r_idx, dtype=torch.long, device=self.device)
         
-        return torch.cat([self.task_emb(t_t), self.role_emb(r_t)], dim=1)
+        txt_arr = np.asarray(text_vectors, dtype=np.float32)
+        if txt_arr.ndim == 1:
+            txt_arr = txt_arr.reshape(1, -1)
+        if txt_arr.shape[1] != self.text_dim:
+            fixed = np.zeros((txt_arr.shape[0], self.text_dim), dtype=np.float32)
+            copy_len = min(self.text_dim, txt_arr.shape[1])
+            fixed[:, :copy_len] = txt_arr[:, :copy_len]
+            txt_arr = fixed
+        txt_t = torch.tensor(txt_arr, dtype=torch.float32, device=self.device)
+
+        return torch.cat([self.task_emb(t_t), self.role_emb(r_t), txt_t], dim=1)
         
-    def forward(self, states):
-        emb = self.encode_states(states)
+    def forward(self, states, text_vectors):
+        emb = self.encode_states(states, text_vectors)
         out = self.net(emb).squeeze(-1) # -> [batch_size]
         return out
         
-    def compute_loss(self, states, labels):
-        risks = self.forward(states)
+    def compute_loss(self, states, text_vectors, labels):
+        risks = self.forward(states, text_vectors)
         labels_t = torch.tensor(labels, dtype=torch.float32, device=self.device)
         return nn.BCELoss()(risks, labels_t)
 
@@ -395,16 +457,38 @@ class DiscreteStateMarkov:
     """
     def __init__(self, classifier):
         self.state_manager = PreDefinedStateManager(classifier)
+        self.text_extractor = TextFeatureExtractor()
         
         # Neural Risk Model
-        self.neural_risk_model = NeuralRiskModel(hidden_dim=64)
-        self.initial_risk_model = InitialRiskModel(hidden_dim=32)
+        self.neural_risk_model = NeuralRiskModel(hidden_dim=128, text_dim=self.text_extractor.dim)
+        self.initial_risk_model = InitialRiskModel(hidden_dim=64, text_dim=self.text_extractor.dim)
         self.optimal_threshold = 0.1
         self.initial_optimal_threshold = 0.5
+        self.use_initial_model = True
+        self.initial_positive_count = 0
         
         # Training data for neural model
-        self.training_transitions = []  # list of (prev_state, curr_state, is_mistake)
-        self.training_initial_states = [] # list of (curr_state, is_mistake)
+        self.training_transitions = []  # list of (prev_state, curr_state, prev_text, curr_text, is_mistake, curr_action, weight)
+        self.training_initial_states = [] # list of (curr_state, curr_text, is_mistake)
+
+    def get_transition_threshold(self, step_idx, total_steps):
+        return float(self.optimal_threshold)
+
+    def _simulate_detection(self, risks, mistake_step, total_steps, initial_threshold):
+        detected_at = -1
+        for idx, risk in enumerate(risks):
+            threshold = initial_threshold if idx == 0 else self.get_transition_threshold(idx, total_steps)
+            if risk > threshold:
+                detected_at = idx
+                break
+
+        if detected_at == -1:
+            return "MISSED"
+        if detected_at == mistake_step:
+            return "EXACT_HIT"
+        if detected_at < mistake_step:
+            return "EARLY_WARN"
+        return "LATE_MATCH"
 
     def optimize_threshold(self, dataset):
         """"
@@ -413,36 +497,38 @@ class DiscreteStateMarkov:
         print("\nOptimizing Detection Threshold...")
         safe_scores = []
         mistake_scores = []
-
         initial_safe_scores = []
         initial_mistake_scores = []
-        
+
         limit_files = len(dataset)
         for idx in tqdm(range(limit_files)):
             json_data = dataset[idx]
             history = json_data.get('history', [])
+            total_steps = len(history)
             ms = json_data.get('mistake_step', -1)
             mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
             task_context = json_data.get('question', '')
             system_prompts = json_data.get('system_prompt', {})
-            
+
             prev_state = None
             has_prior_error = False
-            
-            for i in range(len(history)):
+
+            for i in range(total_steps):
                 curr_msg = history[i]
                 agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
                 desc = system_prompts.get(agent_name, "")
-                
+
                 risk, state, _ = self.get_risk(
-                    task_context, 
-                    curr_msg, 
-                    prev_state, 
-                    has_prior_error, 
-                    is_first_step=(i==0),
-                    agent_description=desc
+                    task_context,
+                    curr_msg,
+                    prev_state,
+                    has_prior_error,
+                    is_first_step=(i == 0),
+                    agent_description=desc,
+                    step_idx=i,
+                    total_steps=total_steps
                 )
-                
+
                 if i == 0:
                     if i == mistake_step:
                         initial_mistake_scores.append(risk)
@@ -453,16 +539,16 @@ class DiscreteStateMarkov:
                         mistake_scores.append(risk)
                     else:
                         safe_scores.append(risk)
-                
-                (_, _, action, _) = state
-                if action == ActionType.FAIL: has_prior_error = True
+
+                (_, _, action, _, _) = state
+                if action == ActionType.FAIL:
+                    has_prior_error = True
                 prev_state = state
 
         if mistake_scores:
             avg_safe = np.mean(safe_scores) if safe_scores else 0.0
             avg_mistake = np.mean(mistake_scores)
             std_safe = np.std(safe_scores) if safe_scores else 0.0
-            
             from sklearn.cluster import KMeans
             all_scores = np.array(safe_scores + mistake_scores).reshape(-1, 1)
             if len(all_scores) >= 2:
@@ -470,12 +556,12 @@ class DiscreteStateMarkov:
                 centers = kmeans.cluster_centers_.flatten()
                 self.optimal_threshold = float(np.mean(centers))
             else:
-                self.optimal_threshold = 0.5
-            
-            print(f"Stats: Avg Safe Risk={avg_safe:.4f} (std={std_safe:.4f}), Avg Mistake Risk={avg_mistake:.4f}")
-            print(f"Selected Optimal Threshold for transition (KMeans Boundary): {self.optimal_threshold:.4f}")
+                self.optimal_threshold = avg_safe + 1.0 * std_safe
 
-        if initial_mistake_scores:
+            print(f"Stats: Avg Safe Risk={avg_safe:.4f} (std={std_safe:.4f}), Avg Mistake Risk={avg_mistake:.4f}")
+            print(f"Selected Optimal Threshold (KMeans Boundary): {self.optimal_threshold:.4f}")
+
+        if initial_mistake_scores and self.use_initial_model:
             avg_safe_init = np.mean(initial_safe_scores) if initial_safe_scores else 0.0
             avg_mistake_init = np.mean(initial_mistake_scores)
             std_safe_init = np.std(initial_safe_scores) if initial_safe_scores else 0.0
@@ -492,9 +578,9 @@ class DiscreteStateMarkov:
             print(f"Init Stats: Avg Safe Risk={avg_safe_init:.4f} (std={std_safe_init:.4f}), Avg Mistake Risk={avg_mistake_init:.4f}")
             print(f"Selected Optimal Threshold for initial step (KMeans Boundary): {self.initial_optimal_threshold:.4f}")
         else:
-            if initial_safe_scores:
-                self.initial_optimal_threshold = float(np.percentile(initial_safe_scores, 50))
-                print(f"Init Stats: Avg Safe Risk={np.mean(initial_safe_scores):.4f}, using 50th percentile {self.initial_optimal_threshold:.4f}")
+            self.use_initial_model = False
+            self.initial_optimal_threshold = 1.0
+            print("Init detector disabled: no reliable step-0 mistake positives in training set.")
 
     def fit(self, dataset):
         print("Fitting Hybrid Markov Model with Neural Risk Learning...")
@@ -505,12 +591,25 @@ class DiscreteStateMarkov:
         for idx in tqdm(range(limit_files)):
             json_data = dataset[idx]
             history = json_data.get('history', [])
+            total_steps = len(history)
             ms = json_data.get('mistake_step', -1)
             mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
             task_context = json_data.get('question', '')
             sys_prompts = json_data.get('system_prompt', {})
+
+            mistake_role = None
+            if 0 <= mistake_step < len(history):
+                m_msg = history[mistake_step]
+                m_name = m_msg.get('name', m_msg.get('role', 'Unknown'))
+                m_desc = sys_prompts.get(m_name, "")
+                try:
+                    m_state = self.state_manager.extract_state(task_context, m_msg, has_prior_error=False, agent_description=m_desc)
+                    mistake_role = m_state[1]
+                except:
+                    mistake_role = None
             
             prev_state_tuple = None
+            prev_text_vec = None
             has_prior_error = False
             
             for i in range(len(history)):
@@ -523,30 +622,50 @@ class DiscreteStateMarkov:
                 except: 
                     continue
                 
-                (c_t, c_r, c_a, c_e) = curr_state
+                (c_t, c_r, c_a, c_e, c_txt) = curr_state
+                curr_text_vec = self.text_extractor.encode(c_txt)
                 
                 is_mistake = (i == mistake_step)
                 
                 if prev_state_tuple:
-                    (p_t, p_r, p_a, p_e) = prev_state_tuple
+                    (p_t, p_r, p_a, p_e, _) = prev_state_tuple
                     
                     # Collect for neural model training
                     prev_neural_state = (p_t, p_r, p_a)   # Now includes prev_action!
                     curr_neural_state = (c_t, c_r)        # Curr action excluded to avoid direct leak
-                    self.training_transitions.append((prev_neural_state, curr_neural_state, int(is_mistake), c_a)) # pass c_a as target
+                    hard_weight = 1.0
+                    if not is_mistake and mistake_step >= 0:
+                        dist = abs(i - mistake_step)
+                        if dist <= 2:
+                            hard_weight += 1.0
+                        if dist <= 1:
+                            hard_weight += 0.5
+
+                        if mistake_role is not None and c_r == mistake_role:
+                            hard_weight += 1.0
+
+                    self.training_transitions.append((prev_neural_state, curr_neural_state, prev_text_vec, curr_text_vec, int(is_mistake), c_a, hard_weight))
                 elif i == 0:
                     curr_neural_state = (c_t, c_r)
-                    self.training_initial_states.append((curr_neural_state, int(is_mistake)))
+                    self.training_initial_states.append((curr_neural_state, curr_text_vec, int(is_mistake)))
                 
                 if c_a == ActionType.FAIL: has_prior_error = True
                 prev_state_tuple = curr_state
+                prev_text_vec = curr_text_vec
         
         # Step 2: Train neural risk model with contrastive learning
         print(f"\n[Step 2/3] Training Neural Risk Model on {len(self.training_transitions)} transitions...")
         self._train_neural_model()
         
-        print(f"Training Initial Risk Model on {len(self.training_initial_states)} step-0 states...")
-        self._train_initial_model()
+        self.initial_positive_count = sum(label for _, _, label in self.training_initial_states)
+        if self.initial_positive_count > 0:
+            self.use_initial_model = True
+            print(f"Training Initial Risk Model on {len(self.training_initial_states)} step-0 states (positives={self.initial_positive_count})...")
+            self._train_initial_model()
+        else:
+            self.use_initial_model = False
+            self.initial_optimal_threshold = 1.0
+            print(f"Skip Initial Risk Model training: 0 positive step-0 mistakes in {len(self.training_initial_states)} samples.")
         
         self.optimize_threshold(dataset)
 
@@ -569,11 +688,14 @@ class DiscreteStateMarkov:
                 
                 prev_states = [transitions[i][0] for i in batch_indices]
                 curr_states = [transitions[i][1] for i in batch_indices]
-                labels = [transitions[i][2] for i in batch_indices]
-                target_actions = [transitions[i][3] for i in batch_indices]
+                prev_texts = [transitions[i][2] for i in batch_indices]
+                curr_texts = [transitions[i][3] for i in batch_indices]
+                labels = [transitions[i][4] for i in batch_indices]
+                target_actions = [transitions[i][5] for i in batch_indices]
+                sample_weights = [transitions[i][6] for i in batch_indices]
                 
                 optimizer.zero_grad()
-                loss = self.neural_risk_model.compute_loss(prev_states, curr_states, labels, target_actions)
+                loss = self.neural_risk_model.compute_loss(prev_states, curr_states, prev_texts, curr_texts, labels, target_actions, sample_weights=sample_weights)
                 loss.backward()
                 optimizer.step()
                 
@@ -599,10 +721,11 @@ class DiscreteStateMarkov:
             for batch_idx in range(0, len(states_data), batch_size):
                 batch_indices = indices[batch_idx:batch_idx+batch_size]
                 states = [states_data[i][0] for i in batch_indices]
-                labels = [states_data[i][1] for i in batch_indices]
+                text_vectors = [states_data[i][1] for i in batch_indices]
+                labels = [states_data[i][2] for i in batch_indices]
                 
                 optimizer.zero_grad()
-                loss = self.initial_risk_model.compute_loss(states, labels)
+                loss = self.initial_risk_model.compute_loss(states, text_vectors, labels)
                 loss.backward()
                 optimizer.step()
                 
@@ -615,16 +738,19 @@ class DiscreteStateMarkov:
         print(f"✓ Initial Risk Model trained successfully\n")
         self.initial_risk_model.eval()
 
-    def get_risk(self, task_context, history_item, prev_state=None, has_prior_error=False, is_first_step=False, agent_description=""):
+    def get_risk(self, task_context, history_item, prev_state=None, has_prior_error=False, is_first_step=False, agent_description="", step_idx=0, total_steps=1):
         state_full = self.state_manager.extract_state(task_context, history_item, has_prior_error, agent_description)
-        (c_t, c_r, c_a, _) = state_full
+        (c_t, c_r, c_a, _, c_txt) = state_full
+        curr_text_vec = self.text_extractor.encode(c_txt)
         
         # If it's the first step, use the Initial Risk Model
         if is_first_step:
+            if not self.use_initial_model:
+                return 0.0, state_full, "InitialDisabled"
             try:
                 with torch.no_grad():
                     curr_neural_state = (c_t, c_r)
-                    initial_risk = self.initial_risk_model.forward([curr_neural_state])
+                    initial_risk = self.initial_risk_model.forward([curr_neural_state], [curr_text_vec])
                     # forward outputs a tensor of shape [batch_size], we extract .item()
                     risk_val = initial_risk[0].item()
                     return risk_val, state_full, "Neural_Initial"
@@ -633,13 +759,14 @@ class DiscreteStateMarkov:
             
         # Primary: Use Neural Risk Model
         if prev_state and not is_first_step:
-            (p_t, p_r, p_a, _) = prev_state
+            (p_t, p_r, p_a, _, p_txt) = prev_state
             prev_neural_state = (p_t, p_r, p_a)  # Include prev action
             curr_neural_state = (c_t, c_r)
+            prev_text_vec = self.text_extractor.encode(p_txt)
             
             try:
                 with torch.no_grad():
-                    neural_risk, _ = self.neural_risk_model.forward(prev_neural_state, curr_neural_state)
+                    neural_risk, _ = self.neural_risk_model.forward(prev_neural_state, curr_neural_state, prev_text_vec, curr_text_vec)
                     return neural_risk, state_full, "Neural"
             except:
                 pass  # Fall back to default if neural fails
@@ -680,6 +807,7 @@ def run_evaluation(markov_model, dataset):
     level_stats = {
         "Neural": {"attempted": 0, "detected": 0, "correct": 0},
         "Neural_Initial": {"attempted": 0, "detected": 0, "correct": 0},
+        "InitialDisabled": {"attempted": 0, "detected": 0, "correct": 0},
         "Level0_FirstStep": {"attempted": 0, "detected": 0, "correct": 0},
         "DefaultSafe": {"attempted": 0, "detected": 0, "correct": 0},
         "No_Detection": {"attempted": 0, "detected": 0, "correct": 0}
@@ -687,7 +815,7 @@ def run_evaluation(markov_model, dataset):
     
     RISK_THRESHOLD = markov_model.optimal_threshold
     INITIAL_RISK_THRESHOLD = getattr(markov_model, 'initial_optimal_threshold', RISK_THRESHOLD)
-    print(f"Using Optimal Risk Threshold: {RISK_THRESHOLD:.4f}")
+    print(f"Using Mean Transition Threshold: {RISK_THRESHOLD:.4f}")
     if hasattr(markov_model, 'initial_optimal_threshold'):
         print(f"Using Initial Optimal Risk Threshold: {INITIAL_RISK_THRESHOLD:.4f}")
     
@@ -695,6 +823,7 @@ def run_evaluation(markov_model, dataset):
     
     for idx, json_data in enumerate(dataset):
         history = json_data.get('history', [])
+        total_steps = len(history)
         ms = json_data.get('mistake_step', -1)
         mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
         task_context = json_data.get('question', '')
@@ -729,7 +858,9 @@ def run_evaluation(markov_model, dataset):
                 prev_state=prev_state, 
                 has_prior_error=has_prior_error, 
                 is_first_step=(i==0),
-                agent_description=agent_description
+                agent_description=agent_description,
+                step_idx=i,
+                total_steps=total_steps
             )
 
             # Record attempt
@@ -747,7 +878,7 @@ def run_evaluation(markov_model, dataset):
                 detected_agent = agent_name
                 detected_level = used_level
             
-            (_, _, action, _) = state
+            (_, _, action, _, _) = state
             if action == ActionType.FAIL:
                 has_prior_error = True
             
@@ -827,11 +958,11 @@ def run_evaluation(markov_model, dataset):
 
 if __name__ == "__main__":
     datasets_dirs = [
-        #"Who&When/Algorithm-Generated",
+        #"Who&When/Algorithm-Generated",，
         #"Who&When/Hand-Crafted",
         "datasets/mmlu",
-        "datasets/aqua",
-        "datasets/humaneval"
+        #"datasets/aqua",
+        #"datasets/humaneval"
     ]
     
     all_files = []
@@ -854,7 +985,7 @@ if __name__ == "__main__":
     # Shuffle combined dataset
     random.shuffle(all_files)
     
-    split = int(len(all_files) * 0.5)
+    split = int(len(all_files) * 0.2)
     train_files = all_files[:split]
     test_files = all_files[split:]
     
