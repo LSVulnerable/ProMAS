@@ -260,23 +260,16 @@ class NeuralRiskModel(nn.Module):
         self.task_types = {t: i for i, t in enumerate(TaskType.all())}
         self.roles = {r: i for i, r in enumerate(AgentRole.all())}
         self.actions = {a: i for i, a in enumerate(ActionType.all())}
-        self.task_emb_dim = 8
-        self.role_emb_dim = 4
-        self.action_emb_dim = 8
-        self.role_influence = 0.2
-        self.action_influence = 0.35
-        self.role_dropout_prob = 0.45
-        self.logic_feature_scale = 1.5
         
-        self.task_emb = nn.Embedding(len(self.task_types), self.task_emb_dim)
-        self.role_emb = nn.Embedding(len(self.roles), self.role_emb_dim)
-        self.action_emb = nn.Embedding(len(self.actions), self.action_emb_dim)
+        self.task_emb = nn.Embedding(len(self.task_types), 16)
+        self.role_emb = nn.Embedding(len(self.roles), 16)
+        self.action_emb = nn.Embedding(len(self.actions), 16)
         self.text_dim = text_dim
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         
         # prev encoded WITH action (Task, Role, PrevAction)
-        prev_dim = self.task_emb_dim + self.role_emb_dim + self.action_emb_dim + self.text_dim
+        prev_dim = (16 * 3) + self.text_dim
         self.prev_encoder = nn.Sequential(
             nn.Linear(prev_dim, hidden_dim),
             nn.ReLU(),
@@ -286,7 +279,7 @@ class NeuralRiskModel(nn.Module):
         )
         
         # curr encoded WITHOUT action (Task, Role)
-        curr_dim = self.task_emb_dim + self.role_emb_dim + self.text_dim
+        curr_dim = (16 * 2) + self.text_dim
         self.curr_encoder = nn.Sequential(
             nn.Linear(curr_dim, hidden_dim),
             nn.ReLU(),
@@ -294,12 +287,10 @@ class NeuralRiskModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
-
-        combined_dim = (hidden_dim * 2) + 2
         
         # 1. Main Task: Predict Risk
         self.risk_head = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid() 
@@ -307,7 +298,7 @@ class NeuralRiskModel(nn.Module):
         
         # 2. Auxiliary Task: Predict Current Action
         self.action_head = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, len(self.actions))
         )
@@ -323,23 +314,6 @@ class NeuralRiskModel(nn.Module):
             fixed[:copy_len] = vec[:copy_len]
             vec = fixed
         return torch.tensor(vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-
-    def _logic_features(self, prev_text, curr_text):
-        prev_t = self._to_text_tensor(prev_text)
-        curr_t = self._to_text_tensor(curr_text)
-        cos_sim = F.cosine_similarity(prev_t, curr_t, dim=1, eps=1e-8).unsqueeze(1)
-        semantic_delta = torch.mean(torch.abs(curr_t - prev_t), dim=1, keepdim=True)
-        feats = torch.cat([cos_sim, semantic_delta], dim=1)
-        return feats * self.logic_feature_scale
-
-    def _apply_role_dropout(self, prev_state, curr_state):
-        if not self.training:
-            return prev_state, curr_state
-        if random.random() >= self.role_dropout_prob:
-            return prev_state, curr_state
-        p_t, _, p_a = prev_state
-        c_t, _ = curr_state
-        return (p_t, AgentRole.THINKER, p_a), (c_t, AgentRole.THINKER)
     
     def encode_prev_state(self, state_tuple, text_vector):
         task_type, role, action = state_tuple
@@ -352,9 +326,7 @@ class NeuralRiskModel(nn.Module):
         role_t = torch.tensor([role_idx], dtype=torch.long, device=self.device)
         action_t = torch.tensor([action_idx], dtype=torch.long, device=self.device)
         text_t = self._to_text_tensor(text_vector)
-        role_vec = self.role_emb(role_t) * self.role_influence
-        action_vec = self.action_emb(action_t) * self.action_influence
-        state_emb = torch.cat([self.task_emb(task_t), role_vec, action_vec, text_t], dim=1)
+        state_emb = torch.cat([self.task_emb(task_t), self.role_emb(role_t), self.action_emb(action_t), text_t], dim=1)
         return state_emb
 
     def encode_curr_state(self, state_tuple, text_vector):
@@ -366,8 +338,7 @@ class NeuralRiskModel(nn.Module):
         task_t = torch.tensor([task_idx], dtype=torch.long, device=self.device)
         role_t = torch.tensor([role_idx], dtype=torch.long, device=self.device)
         text_t = self._to_text_tensor(text_vector)
-        role_vec = self.role_emb(role_t) * self.role_influence
-        state_emb = torch.cat([self.task_emb(task_t), role_vec, text_t], dim=1)
+        state_emb = torch.cat([self.task_emb(task_t), self.role_emb(role_t), text_t], dim=1)
         return state_emb
     
     def forward(self, prev_state, curr_state, prev_text, curr_text):
@@ -376,9 +347,8 @@ class NeuralRiskModel(nn.Module):
         
         prev_encoded = self.prev_encoder(prev_emb)  
         curr_encoded = self.curr_encoder(curr_emb)  
-        logic_feats = self._logic_features(prev_text, curr_text)
         
-        combined = torch.cat([prev_encoded, curr_encoded, logic_feats], dim=1)  
+        combined = torch.cat([prev_encoded, curr_encoded], dim=1)  
         
         risk = self.risk_head(combined) 
         action_logits = self.action_head(combined)
@@ -398,12 +368,10 @@ class NeuralRiskModel(nn.Module):
     def compute_loss(self, prev_states, curr_states, prev_texts, curr_texts, labels, target_actions, sample_weights=None):
         risks, action_preds = [], []
         for p_state, c_state, p_txt, c_txt in zip(prev_states, curr_states, prev_texts, curr_texts):
-            p_state, c_state = self._apply_role_dropout(p_state, c_state)
             prev_emb = self.encode_prev_state(p_state, p_txt)
             curr_emb = self.encode_curr_state(c_state, c_txt)
-            logic_feats = self._logic_features(p_txt, c_txt)
             
-            combined = torch.cat([self.prev_encoder(prev_emb), self.curr_encoder(curr_emb), logic_feats], dim=1)
+            combined = torch.cat([self.prev_encoder(prev_emb), self.curr_encoder(curr_emb)], dim=1)
             risks.append(self.risk_head(combined))
             action_preds.append(self.action_head(combined))
             
@@ -433,16 +401,12 @@ class InitialRiskModel(nn.Module):
         super().__init__()
         self.task_types = {t: i for i, t in enumerate(TaskType.all())}
         self.roles = {r: i for i, r in enumerate(AgentRole.all())}
-        self.task_emb_dim = 8
-        self.role_emb_dim = 4
-        self.role_influence = 0.2
-        self.role_dropout_prob = 0.35
         
-        self.task_emb = nn.Embedding(len(self.task_types), self.task_emb_dim)
-        self.role_emb = nn.Embedding(len(self.roles), self.role_emb_dim)
+        self.task_emb = nn.Embedding(len(self.task_types), 16)
+        self.role_emb = nn.Embedding(len(self.roles), 16)
         self.text_dim = text_dim
         
-        state_dim = self.task_emb_dim + self.role_emb_dim + self.text_dim
+        state_dim = (16 * 2) + self.text_dim
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -455,11 +419,7 @@ class InitialRiskModel(nn.Module):
         
     def encode_states(self, states, text_vectors):
         t_idx = [self.task_types.get(s[0], 0) for s in states]
-        if self.training:
-            roles = [AgentRole.THINKER if random.random() < self.role_dropout_prob else s[1] for s in states]
-        else:
-            roles = [s[1] for s in states]
-        r_idx = [self.roles.get(role, 0) for role in roles]
+        r_idx = [self.roles.get(s[1], 0) for s in states]
         
         t_t = torch.tensor(t_idx, dtype=torch.long, device=self.device)
         r_t = torch.tensor(r_idx, dtype=torch.long, device=self.device)
@@ -474,8 +434,7 @@ class InitialRiskModel(nn.Module):
             txt_arr = fixed
         txt_t = torch.tensor(txt_arr, dtype=torch.float32, device=self.device)
 
-        role_vec = self.role_emb(r_t) * self.role_influence
-        return torch.cat([self.task_emb(t_t), role_vec, txt_t], dim=1)
+        return torch.cat([self.task_emb(t_t), self.role_emb(r_t), txt_t], dim=1)
         
     def forward(self, states, text_vectors):
         emb = self.encode_states(states, text_vectors)
@@ -507,11 +466,6 @@ class DiscreteStateMarkov:
         self.initial_optimal_threshold = 0.5
         self.use_initial_model = True
         self.initial_positive_count = 0
-        self.agent_bias = {}
-        self.agent_bias_cap = 0.18
-        self.agent_bias_min_support = 5
-        self.hazard_horizon = 1
-        self.min_detection_step = 1
         
         # Training data for neural model
         self.training_transitions = []  # list of (prev_state, curr_state, prev_text, curr_text, is_mistake, curr_action, weight)
@@ -520,65 +474,9 @@ class DiscreteStateMarkov:
     def get_transition_threshold(self, step_idx, total_steps):
         return float(self.optimal_threshold)
 
-    def _is_hazard_positive(self, step_idx, mistake_step):
-        if mistake_step < 0:
-            return False
-        return (step_idx <= mistake_step) and (step_idx >= mistake_step - self.hazard_horizon)
-
-    def normalize_agent_name(self, agent_name):
-        if agent_name is None:
-            return "unknown"
-        name = str(agent_name).strip()
-        if "->" in name:
-            rhs = name.split("->", 1)[1].strip().replace(")", "").strip()
-            if rhs:
-                name = rhs
-        if "(" in name:
-            name = name.split("(", 1)[0].strip()
-        return name.lower()
-
-    def calibrate_risk(self, risk, agent_name):
-        key = self.normalize_agent_name(agent_name)
-        bias = float(self.agent_bias.get(key, 0.0))
-        value = float(risk) - bias
-        if value < 0.0:
-            return 0.0
-        if value > 1.0:
-            return 1.0
-        return value
-
-    def predict_blame_agent(self, step_records, trigger_idx, window=2):
-        if not step_records:
-            return "UNKNOWN"
-        start = max(0, trigger_idx - window)
-        end = min(len(step_records) - 1, trigger_idx + window)
-        score_by_agent = defaultdict(float)
-        name_by_agent = {}
-
-        for j in range(start, end + 1):
-            idx_j, agent_j, risk_j = step_records[j]
-            agent_norm = self.normalize_agent_name(agent_j)
-            name_by_agent[agent_norm] = agent_j
-            if j == 0:
-                score_by_agent[agent_norm] += 0.15 * float(risk_j)
-                continue
-            prev_risk = float(step_records[j - 1][2])
-            delta = float(risk_j) - prev_risk
-            if delta > 0:
-                score_by_agent[agent_norm] += (1.3 * delta) + (0.2 * float(risk_j))
-            else:
-                score_by_agent[agent_norm] += 0.05 * float(risk_j)
-
-        if score_by_agent:
-            best_norm = max(score_by_agent.items(), key=lambda kv: kv[1])[0]
-            return name_by_agent.get(best_norm, step_records[trigger_idx][1])
-        return step_records[trigger_idx][1]
-
     def _simulate_detection(self, risks, mistake_step, total_steps, initial_threshold):
         detected_at = -1
         for idx, risk in enumerate(risks):
-            if idx > 0 and idx < self.min_detection_step:
-                continue
             threshold = initial_threshold if idx == 0 else self.get_transition_threshold(idx, total_steps)
             if risk > threshold:
                 detected_at = idx
@@ -601,12 +499,6 @@ class DiscreteStateMarkov:
         mistake_scores = []
         initial_safe_scores = []
         initial_mistake_scores = []
-        raw_records = []
-        case_risk_records = []
-        mistake_steps_train = []
-        raw_safe_agent = defaultdict(list)
-        raw_mistake_agent = defaultdict(list)
-        self.agent_bias = {}
 
         limit_files = len(dataset)
         for idx in tqdm(range(limit_files)):
@@ -617,7 +509,6 @@ class DiscreteStateMarkov:
             mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
             task_context = json_data.get('question', '')
             system_prompts = json_data.get('system_prompt', {})
-            case_step_risks = []
 
             prev_state = None
             has_prior_error = False
@@ -638,110 +529,37 @@ class DiscreteStateMarkov:
                     total_steps=total_steps
                 )
 
-                risk = float(risk)
-                agent_norm = self.normalize_agent_name(agent_name)
-                raw_records.append((risk, agent_norm, i, mistake_step))
-                case_step_risks.append(risk)
-
-                if i > 0:
-                    if self._is_hazard_positive(i, mistake_step):
-                        raw_mistake_agent[agent_norm].append(risk)
+                if i == 0:
+                    if i == mistake_step:
+                        initial_mistake_scores.append(risk)
                     else:
-                        raw_safe_agent[agent_norm].append(risk)
+                        initial_safe_scores.append(risk)
+                else:
+                    if i == mistake_step:
+                        mistake_scores.append(risk)
+                    else:
+                        safe_scores.append(risk)
 
                 (_, _, action, _, _) = state
                 if action == ActionType.FAIL:
                     has_prior_error = True
                 prev_state = state
 
-            if mistake_step >= 0 and case_step_risks:
-                case_risk_records.append((case_step_risks, mistake_step, total_steps))
-                mistake_steps_train.append(mistake_step)
-
-        if mistake_steps_train:
-            p20 = int(np.percentile(np.array(mistake_steps_train), 20))
-            self.min_detection_step = max(1, p20)
-        else:
-            self.min_detection_step = 1
-
-        all_safe_vals = []
-        for vals in raw_safe_agent.values():
-            all_safe_vals.extend(vals)
-        global_safe_mean = float(np.mean(all_safe_vals)) if all_safe_vals else 0.0
-
-        for agent_norm, safe_vals in raw_safe_agent.items():
-            if len(safe_vals) < self.agent_bias_min_support:
-                continue
-            safe_mean = float(np.mean(safe_vals))
-            raw_bias = safe_mean - global_safe_mean
-            if raw_bias <= 0.0:
-                continue
-            mistake_vals = raw_mistake_agent.get(agent_norm, [])
-            if len(mistake_vals) >= 3:
-                sep = float(np.mean(mistake_vals)) - safe_mean
-                if sep >= 0.07:
-                    raw_bias *= 0.35
-                elif sep >= 0.03:
-                    raw_bias *= 0.60
-            self.agent_bias[agent_norm] = float(np.clip(raw_bias, 0.0, self.agent_bias_cap))
-
-        for raw_risk, agent_norm, step_idx, mistake_step in raw_records:
-            risk = self.calibrate_risk(raw_risk, agent_norm)
-            if step_idx == 0:
-                if self._is_hazard_positive(step_idx, mistake_step):
-                    initial_mistake_scores.append(risk)
-                else:
-                    initial_safe_scores.append(risk)
-            else:
-                if self._is_hazard_positive(step_idx, mistake_step):
-                    mistake_scores.append(risk)
-                else:
-                    safe_scores.append(risk)
-
         if mistake_scores:
             avg_safe = np.mean(safe_scores) if safe_scores else 0.0
             avg_mistake = np.mean(mistake_scores)
             std_safe = np.std(safe_scores) if safe_scores else 0.0
-
-            all_scores = safe_scores + mistake_scores
-            if all_scores and case_risk_records:
-                candidates = np.unique(np.quantile(np.array(all_scores), np.linspace(0.20, 0.98, 40))).tolist()
-                best_obj = -1e9
-                best_th = float(np.percentile(np.array(all_scores), 65))
-                init_th = self.initial_optimal_threshold if self.use_initial_model else 1.0
-
-                for th in candidates:
-                    self.optimal_threshold = float(th)
-                    exact_cnt, early_cnt, miss_cnt = 0, 0, 0
-                    for risks_case, ms_case, total_case in case_risk_records:
-                        outcome = self._simulate_detection(risks_case, ms_case, total_case, init_th)
-                        if outcome == "EXACT_HIT":
-                            exact_cnt += 1
-                        elif outcome == "EARLY_WARN":
-                            early_cnt += 1
-                        elif outcome == "MISSED":
-                            miss_cnt += 1
-                    total_cnt = len(case_risk_records)
-                    exact_rate = exact_cnt / total_cnt if total_cnt else 0.0
-                    early_rate = early_cnt / total_cnt if total_cnt else 0.0
-                    miss_rate = miss_cnt / total_cnt if total_cnt else 0.0
-                    objective = (2.8 * exact_rate) - (1.4 * early_rate) - (1.0 * miss_rate)
-                    if objective > best_obj:
-                        best_obj = objective
-                        best_th = float(th)
-
-                self.optimal_threshold = best_th
+            from sklearn.cluster import KMeans
+            all_scores = np.array(safe_scores + mistake_scores).reshape(-1, 1)
+            if len(all_scores) >= 2:
+                kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(all_scores)
+                centers = kmeans.cluster_centers_.flatten()
+                self.optimal_threshold = float(np.mean(centers))
             else:
                 self.optimal_threshold = avg_safe + 1.0 * std_safe
 
             print(f"Stats: Avg Safe Risk={avg_safe:.4f} (std={std_safe:.4f}), Avg Mistake Risk={avg_mistake:.4f}")
-            print(f"Selected Optimal Threshold (Exact-oriented): {self.optimal_threshold:.4f}")
-            print(f"Learned Min Detection Step: {self.min_detection_step}")
-            if self.agent_bias:
-                top_bias = sorted(self.agent_bias.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                print("Top agent bias calibration:")
-                for agent_norm, bias in top_bias:
-                    print(f"  {agent_norm}: -{bias:.4f}")
+            print(f"Selected Optimal Threshold (KMeans Boundary): {self.optimal_threshold:.4f}")
 
         if initial_mistake_scores and self.use_initial_model:
             avg_safe_init = np.mean(initial_safe_scores) if initial_safe_scores else 0.0
@@ -807,7 +625,7 @@ class DiscreteStateMarkov:
                 (c_t, c_r, c_a, c_e, c_txt) = curr_state
                 curr_text_vec = self.text_extractor.encode(c_txt)
                 
-                is_mistake = self._is_hazard_positive(i, mistake_step)
+                is_mistake = (i == mistake_step)
                 
                 if prev_state_tuple:
                     (p_t, p_r, p_a, p_e, _) = prev_state_tuple
@@ -824,7 +642,7 @@ class DiscreteStateMarkov:
                             hard_weight += 0.5
 
                         if mistake_role is not None and c_r == mistake_role:
-                            hard_weight += 0.15
+                            hard_weight += 1.0
 
                     self.training_transitions.append((prev_neural_state, curr_neural_state, prev_text_vec, curr_text_vec, int(is_mistake), c_a, hard_weight))
                 elif i == 0:
@@ -1028,7 +846,6 @@ def run_evaluation(markov_model, dataset):
         prev_state = None
         has_prior_error = False
         max_observed_risk = 0.0
-        step_records = []
         
         for i in range(limit):
             curr_msg = history[i]
@@ -1045,8 +862,6 @@ def run_evaluation(markov_model, dataset):
                 step_idx=i,
                 total_steps=total_steps
             )
-            risk = markov_model.calibrate_risk(risk, agent_name)
-            step_records.append((i, agent_name, risk))
 
             # Record attempt
             if used_level in level_stats:
@@ -1058,9 +873,7 @@ def run_evaluation(markov_model, dataset):
             threshold = INITIAL_RISK_THRESHOLD if i == 0 else RISK_THRESHOLD
             
             # Only detect if not yet detected
-            if i > 0 and i < markov_model.min_detection_step:
-                pass
-            elif detected_at == -1 and risk > threshold:
+            if detected_at == -1 and risk > threshold:
                 detected_at = i
                 detected_agent = agent_name
                 detected_level = used_level
@@ -1072,10 +885,7 @@ def run_evaluation(markov_model, dataset):
             prev_state = state
         
         if detected_at != -1:
-            detected_agent = markov_model.predict_blame_agent(step_records, detected_at, window=2)
-            detected_norm = markov_model.normalize_agent_name(detected_agent)
-            expected_norm = markov_model.normalize_agent_name(mistake_agent)
-            agent_match = detected_norm == expected_norm
+            agent_match = detected_agent == mistake_agent
             if agent_match:
                 stats["agent_hit"] += 1
             
@@ -1149,10 +959,10 @@ def run_evaluation(markov_model, dataset):
 if __name__ == "__main__":
     datasets_dirs = [
         #"Who&When/Algorithm-Generated",，
-        "Who&When/Hand-Crafted",
+        #"Who&When/Hand-Crafted",
         #"datasets/mmlu",
         #"datasets/aqua",
-        #"datasets/humaneval"
+        "datasets/humaneval"
     ]
     
     all_files = []
