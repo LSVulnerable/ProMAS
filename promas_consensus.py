@@ -11,6 +11,7 @@ import re
 from collections import Counter, defaultdict
 from tqdm import tqdm
 import random
+import math
 
 # Set Deterministic Seeds
 SEED = 42
@@ -73,7 +74,7 @@ class LLMStateClassifier:
     """
     def __init__(self, model_path="meta-llama/Meta-Llama-3.1-8B-Instruct"):
         self.device_map = "auto"
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda:1" if torch.cuda.is_available() else "cpu"
 
         possible_paths = [
             "/home/ls/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots",
@@ -405,7 +406,18 @@ class NeuralRiskModel(nn.Module):
         risk = self.risk_head(combined)
         return risk.squeeze().item()
 
-    def compute_loss(self, node_states, task_texts, prev_texts, curr_texts, labels, next_actions, sample_weights=None):
+    def compute_loss(
+        self,
+        node_states,
+        task_texts,
+        prev_texts,
+        curr_texts,
+        labels,
+        next_actions,
+        sample_weights=None,
+        class_pos_weight=1.0,
+        focal_gamma=2.0,
+    ):
         logits = []
         for n_state, t_txt, p_txt, c_txt in zip(node_states, task_texts, prev_texts, curr_texts):
             node_emb = self.encode_node_state(n_state, c_txt)
@@ -418,8 +430,18 @@ class NeuralRiskModel(nn.Module):
         labels_t = torch.tensor(labels, dtype=torch.float32, device=self.device)
         w_t = torch.tensor(sample_weights, dtype=torch.float32, device=self.device) if sample_weights is not None else None
 
-        # Main risk supervision (success/failure transition labels).
-        loss_vec = F.binary_cross_entropy_with_logits(logits, labels_t, reduction='none')
+        # Main risk supervision with class-imbalance and focal re-weighting.
+        pos_w = torch.tensor(float(max(class_pos_weight, 1.0)), dtype=torch.float32, device=self.device)
+        loss_vec = F.binary_cross_entropy_with_logits(
+            logits,
+            labels_t,
+            reduction='none',
+            pos_weight=pos_w,
+        )
+        probs = torch.sigmoid(logits)
+        pt = torch.where(labels_t >= 0.5, probs, 1.0 - probs)
+        focal_factor = torch.pow(1.0 - pt, focal_gamma)
+        loss_vec = loss_vec * focal_factor
         if w_t is not None:
             loss_vec = loss_vec * w_t
 
@@ -429,7 +451,6 @@ class NeuralRiskModel(nn.Module):
             dtype=torch.float32,
             device=self.device,
         )
-        probs = torch.sigmoid(logits)
         action_ref_loss = F.mse_loss(probs, action_targets)
 
         # Contrastive separation: failures should have higher risk than successes.
@@ -462,6 +483,8 @@ class DiscreteStateMarkov:
         self.global_impact_count = 0
         self.global_hazard_rate = 0.5
         self.training_transitions = []
+        self.neighbor_positive_weight = 0.25
+        self.class_pos_weight = 1.0
 
     def _node_state(self, prev_state, next_state):
         _, prev_action, curr_consensus, _ = prev_state
@@ -484,7 +507,12 @@ class DiscreteStateMarkov:
         effective_step = 0 if step_idx == -1 else step_idx + 1
         if mistake_step < 0:
             return 0.0
-        return 1.0 if effective_step == mistake_step else 0.0
+        if effective_step == mistake_step:
+            return 1.0
+        # Soft positives around the mistake step reduce extreme one-positive sparsity.
+        if abs(effective_step - mistake_step) == 1:
+            return float(self.neighbor_positive_weight)
+        return 0.0
 
     def _cluster_boundary(self, success_scores, failure_scores):
         """
@@ -501,7 +529,7 @@ class DiscreteStateMarkov:
         success_mean = float(np.mean(np.array(success_scores, dtype=np.float32)))
         failure_mean = float(np.mean(np.array(failure_scores, dtype=np.float32)))
         
-        # Weighted boundary: favor failure distribution (70%) to be more sensitive to failures
+        # Weighted boundary: favor failure distribution (80%) to be more sensitive to failures
         threshold = (success_mean * 0.8) + (failure_mean * 0.2)
         return float(np.clip(threshold, 0.01, 0.99))
 
@@ -720,6 +748,17 @@ class DiscreteStateMarkov:
             self.global_hazard_rate = (total_hazard / total_transitions) if total_transitions > 0 else 0.5
         else:
             self.global_hazard_rate = 0.5
+
+        hard_pos = sum(1 for t in self.training_transitions if t[4] >= 0.5)
+        hard_neg = max(1, len(self.training_transitions) - hard_pos)
+        if hard_pos > 0:
+            self.class_pos_weight = float(np.clip(hard_neg / hard_pos, 1.0, 20.0))
+        else:
+            self.class_pos_weight = 1.0
+        print(
+            f"Class balance: hard_pos={hard_pos}, hard_neg={hard_neg}, "
+            f"pos_weight={self.class_pos_weight:.2f}"
+        )
         
         print(f"\n[Step 2/3] Training Neural Risk Model on {len(self.training_transitions)} transitions...")
         self._train_neural_model()
@@ -733,16 +772,28 @@ class DiscreteStateMarkov:
         if not transitions:
             print("No transitions to train.")
             return
-        n_batches = len(transitions) // batch_size
+        n_batches = max(1, math.ceil(len(transitions) / batch_size))
+
+        pos_indices = [i for i, t in enumerate(transitions) if t[4] >= 0.5]
+        neg_indices = [i for i, t in enumerate(transitions) if t[4] < 0.5]
         
         for epoch in range(epochs):
             epoch_loss = 0.0
             
-            # Shuffle transitions
-            indices = np.random.permutation(len(transitions))
-            
-            for batch_idx in range(0, len(transitions), batch_size):
-                batch_indices = indices[batch_idx:batch_idx+batch_size]
+            for _ in range(n_batches):
+                if pos_indices and neg_indices:
+                    n_pos = min(len(pos_indices), max(1, batch_size // 2))
+                    n_neg = batch_size - n_pos
+                    pos_pick = np.random.choice(pos_indices, size=n_pos, replace=(len(pos_indices) < n_pos))
+                    neg_pick = np.random.choice(neg_indices, size=n_neg, replace=(len(neg_indices) < n_neg))
+                    batch_indices = np.concatenate([pos_pick, neg_pick])
+                    np.random.shuffle(batch_indices)
+                else:
+                    batch_indices = np.random.choice(
+                        len(transitions),
+                        size=min(batch_size, len(transitions)),
+                        replace=False,
+                    )
                 
                 node_states = [transitions[i][0] for i in batch_indices]
                 task_texts = [transitions[i][1] for i in batch_indices]
@@ -761,6 +812,7 @@ class DiscreteStateMarkov:
                     labels,
                     next_actions,
                     sample_weights=sample_weights,
+                    class_pos_weight=self.class_pos_weight,
                 )
                 loss.backward()
                 optimizer.step()
@@ -870,7 +922,8 @@ def run_evaluation(markov_model, dataset):
         "detected": 0,
         "early_detection": 0,
         "agent_hit": 0,
-        "detection_with_correct_agent": 0
+        "detection_with_correct_agent": 0,
+        "peak_risk_recall_hits": 0,
     }
     
     RISK_THRESHOLD = markov_model.optimal_threshold
@@ -897,13 +950,11 @@ def run_evaluation(markov_model, dataset):
         outcome = "MISSED"
         agent_match = False
         
-        limit = min(len(history), mistake_step + 5)
-        
         max_observed_risk = 0.0
         step_records = []
 
-        # Unified loop: handle all transitions uniformly from step_idx=-1 (task→first) onwards
-        for i in range(-1, max(-1, limit - 1)):
+        # Unified loop: handle all transitions uniformly from step_idx=-1 (task->first) onwards.
+        for i in range(-1, max(-1, total_steps - 1)):
             risk, next_state, transition_key = markov_model.get_transition_risk(
                 task_context=task_context,
                 history=history,
@@ -930,6 +981,14 @@ def run_evaluation(markov_model, dataset):
             if detected_at == -1 and risk > threshold:
                 detected_at = target_idx
                 detected_agent = agent_name
+
+        # New metric: peak-risk step recall over full trajectory.
+        if step_records:
+            peak_step, peak_agent, peak_risk = max(step_records, key=lambda x: x[2])
+            if peak_step == mistake_step:
+                stats["peak_risk_recall_hits"] += 1
+        else:
+            peak_step, peak_agent, peak_risk = -1, "UNKNOWN", 0.0
         
         if detected_at != -1:
             detected_norm = markov_model.normalize_agent_name(detected_agent)
@@ -956,10 +1015,12 @@ def run_evaluation(markov_model, dataset):
             detect_ratios.append(detected_at / len(history))
             agent_status = "✓" if agent_match else "✗"
             print(f"[ID {idx}] {outcome} @ {detected_at} (Tgt: {mistake_step}) Agent: {detected_agent} {agent_status} (Expected: {mistake_agent})")
+            print(f"           PeakRisk @ {peak_step} (risk={peak_risk:.4f}, agent={peak_agent})")
 
         else:
             detect_ratios.append(1.0)
             print(f"[ID {idx}] MISSED {mistake_step} (Risk @ Mistake Step: {max_observed_risk:.4f})")
+            print(f"           PeakRisk @ {peak_step} (risk={peak_risk:.4f}, agent={peak_agent})")
 
     print("\n=== Final Results ===")
     print(f"Total Valid Cases: {stats['valid_cases']}")
@@ -967,6 +1028,10 @@ def run_evaluation(markov_model, dataset):
     print(f"Early Warning: {stats['early_detection']} ({stats['early_detection']/stats['valid_cases']:.2%})")
     combined = stats['detected'] + stats['early_detection']
     print(f"Combined Recall (Exact+Early): {combined/stats['valid_cases']:.2%}")
+    print(
+        f"Peak-Risk Step Recall: {stats['peak_risk_recall_hits']} "
+        f"({stats['peak_risk_recall_hits']/stats['valid_cases']:.2%})"
+    )
     print(f"\nAgent Hit Rate: {stats['agent_hit']} ({stats['agent_hit']/stats['valid_cases']:.2%})")
     print(f"Detection with Correct Agent: {stats['detection_with_correct_agent']} ({stats['detection_with_correct_agent']/stats['valid_cases']:.2%})")
     print(f"Avg Detection position ratio: {np.mean(detect_ratios):.4f}")
@@ -974,11 +1039,11 @@ def run_evaluation(markov_model, dataset):
 
 if __name__ == "__main__":
     datasets_dirs = [
-        #"Who&When/Algorithm-Generated",
+        "Who&When/Algorithm-Generated",
         #"Who&When/Hand-Crafted",
-        "datasets/mmlu",
-        "datasets/aqua",
-        "datasets/humaneval"
+        #"datasets/mmlu",
+        #"datasets/aqua",
+        #"datasets/humaneval"
     ]
     
     all_files = []
