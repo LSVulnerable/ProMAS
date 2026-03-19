@@ -305,24 +305,13 @@ class TextFeatureExtractor:
 class NeuralRiskModel(nn.Module):
     """
     Risk scorer over Markov node state: (prev_action, curr_consensus, next_role).
-    next_action is used only in loss as behavioral reference, not as model input.
     """
-    def __init__(self, hidden_dim=128, text_dim=384, dropout=0.2):
+    def __init__(self, hidden_dim=128, text_dim=384, dropout=0.2, focal_alpha=0.75, focal_gamma=2.0):
         super().__init__()
 
         self.actions = {c: i for i, c in enumerate(ActionType.all())}
         self.consensuses = {c: i for i, c in enumerate(ConsensusState.all())}
         self.roles = {c: i for i, c in enumerate(AgentRole.all())}
-
-        self.action_reference = {
-            ActionType.OK: 0.05,
-            ActionType.EVALUATION: 0.20,
-            ActionType.PLANNING: 0.30,
-            ActionType.TOOL_CALL: 0.40,
-            ActionType.INFORMATION: 0.45,
-            ActionType.ACT: 0.55,
-            ActionType.FAIL: 0.95,
-        }
 
         emb_dim = 8
         self.prev_action_emb = nn.Embedding(len(self.actions), emb_dim)
@@ -330,6 +319,9 @@ class NeuralRiskModel(nn.Module):
         self.next_role_emb = nn.Embedding(len(self.roles), emb_dim)
 
         self.text_dim = text_dim
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+
         state_dim = (emb_dim * 3) + self.text_dim
         self.node_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -340,7 +332,8 @@ class NeuralRiskModel(nn.Module):
         self.risk_head = nn.Sequential(
             nn.Linear(hidden_dim + 6, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
         )
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -406,64 +399,96 @@ class NeuralRiskModel(nn.Module):
         risk = self.risk_head(combined)
         return risk.squeeze().item()
 
-    def compute_loss(
-        self,
-        node_states,
-        task_texts,
-        prev_texts,
-        curr_texts,
-        labels,
-        next_actions,
-        sample_weights=None,
-        class_pos_weight=1.0,
-        focal_gamma=2.0,
-    ):
-        logits = []
+    def focal_bce_loss(self, probs, labels, sample_weights=None):
+        probs = torch.clamp(probs, 1e-6, 1 - 1e-6)
+        bce = F.binary_cross_entropy(probs, labels, reduction='none')
+        pt = torch.where(labels == 1, probs, 1 - probs)
+        alpha_t = torch.where(labels == 1, self.focal_alpha, 1 - self.focal_alpha)
+        focal = alpha_t * ((1 - pt) ** self.focal_gamma) * bce
+        if sample_weights is not None:
+            focal = focal * sample_weights
+        return focal.mean()
+
+    def compute_loss(self, node_states, task_texts, prev_texts, curr_texts, labels, sample_weights=None):
+        risks = []
         for n_state, t_txt, p_txt, c_txt in zip(node_states, task_texts, prev_texts, curr_texts):
             node_emb = self.encode_node_state(n_state, c_txt)
             node_encoded = self.node_encoder(node_emb)
             logic_feats = self._logic_features(t_txt, p_txt, c_txt)
             combined = torch.cat([node_encoded, logic_feats], dim=1)
-            logits.append(self.risk_head(combined))
+            risks.append(self.risk_head(combined))
 
-        logits = torch.cat(logits).squeeze(-1)
+        risks = torch.cat(risks).squeeze(-1)
         labels_t = torch.tensor(labels, dtype=torch.float32, device=self.device)
-        w_t = torch.tensor(sample_weights, dtype=torch.float32, device=self.device) if sample_weights is not None else None
+        
+        sample_weights_t = None
+        if sample_weights is not None:
+            sample_weights_t = torch.tensor(sample_weights, dtype=torch.float32, device=self.device)
+            
+        return self.focal_bce_loss(risks, labels_t, sample_weights=sample_weights_t)
 
-        # Main risk supervision with class-imbalance and focal re-weighting.
-        pos_w = torch.tensor(float(max(class_pos_weight, 1.0)), dtype=torch.float32, device=self.device)
-        loss_vec = F.binary_cross_entropy_with_logits(
-            logits,
-            labels_t,
-            reduction='none',
-            pos_weight=pos_w,
+
+class InitialRiskModel(nn.Module):
+    """
+    Learns risk for the very first step based on (TaskType, initial_role).
+    """
+    def __init__(self, hidden_dim=64, text_dim=384, dropout=0.2):
+        super().__init__()
+        self.task_types = {t: i for i, t in enumerate(TaskType.all())}
+        self.roles = {r: i for i, r in enumerate(AgentRole.all())}
+        
+        self.task_emb = nn.Embedding(len(self.task_types), 16)
+        self.role_emb = nn.Embedding(len(self.roles), 16)
+        self.text_dim = text_dim
+        
+        state_dim = (16 * 2) + self.text_dim
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
         )
-        probs = torch.sigmoid(logits)
-        pt = torch.where(labels_t >= 0.5, probs, 1.0 - probs)
-        focal_factor = torch.pow(1.0 - pt, focal_gamma)
-        loss_vec = loss_vec * focal_factor
-        if w_t is not None:
-            loss_vec = loss_vec * w_t
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.to(self.device)
+        
+    def encode_states(self, states, text_vectors):
+        t_idx = [self.task_types.get(s[0], 0) for s in states]
+        r_idx = [self.roles.get(s[1], 0) for s in states]
+        
+        t_t = torch.tensor(t_idx, dtype=torch.long, device=self.device)
+        r_t = torch.tensor(r_idx, dtype=torch.long, device=self.device)
+        
+        txt_arr = np.asarray(text_vectors, dtype=np.float32).flatten()
+        if len(states) == 1:
+            txt_arr = txt_arr.reshape(1, -1)
+        else:
+            txt_arr = txt_arr.reshape(len(states), -1)
+            
+        if txt_arr.shape[1] != self.text_dim:
+            fixed = np.zeros((txt_arr.shape[0], self.text_dim), dtype=np.float32)
+            copy_len = min(self.text_dim, txt_arr.shape[1])
+            fixed[:, :copy_len] = txt_arr[:, :copy_len]
+            txt_arr = fixed
+        txt_t = torch.tensor(txt_arr, dtype=torch.float32, device=self.device)
 
-        # Action is used only as training reference target, not model input.
-        action_targets = torch.tensor(
-            [self.action_reference.get(a, 0.5) for a in next_actions],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        action_ref_loss = F.mse_loss(probs, action_targets)
-
-        # Contrastive separation: failures should have higher risk than successes.
-        pos_logits = logits[labels_t >= 0.5]
-        neg_logits = logits[labels_t < 0.5]
-        contrastive = torch.tensor(0.0, device=self.device)
-        if len(pos_logits) > 0 and len(neg_logits) > 0:
-            margin = 0.25
-            contrastive = F.relu(margin - (torch.mean(pos_logits) - torch.mean(neg_logits)))
-
-        return loss_vec.mean() + (0.25 * action_ref_loss) + (0.20 * contrastive)
+        return torch.cat([self.task_emb(t_t), self.role_emb(r_t), txt_t], dim=1)
+        
+    def forward(self, states, text_vectors):
+        emb = self.encode_states(states, text_vectors)
+        out = self.net(emb).squeeze(-1)
+        return out
+        
+    def compute_loss(self, states, text_vectors, labels):
+        risks = self.forward(states, text_vectors)
+        labels_t = torch.tensor(labels, dtype=torch.float32, device=self.device)
+        if risks.dim() == 0:
+            risks = risks.unsqueeze(0)
+            labels_t = labels_t.unsqueeze(0)
+        return nn.BCELoss()(risks, labels_t)
 
 class DiscreteStateMarkov:
+
     """
     Hybrid Model:
     1. Hierarchical Markov Chain (for statistical priors)
@@ -475,6 +500,9 @@ class DiscreteStateMarkov:
         self.text_extractor = TextFeatureExtractor()
 
         self.neural_risk_model = NeuralRiskModel(hidden_dim=128, text_dim=self.text_extractor.dim)
+        self.initial_risk_model = InitialRiskModel(hidden_dim=64, text_dim=self.text_extractor.dim)
+        self.initial_optimal_threshold = 0.5
+        self.training_initial_states = []
         self.optimal_threshold = 0.5
         self.transition_thresholds = {}
         self.transition_counts = defaultdict(int)
@@ -504,7 +532,7 @@ class DiscreteStateMarkov:
         return float(hazard / total)
 
     def _transition_label(self, step_idx, mistake_step):
-        effective_step = 0 if step_idx == -1 else step_idx + 1
+        effective_step = step_idx + 1
         if mistake_step < 0:
             return 0.0
         if effective_step == mistake_step:
@@ -514,24 +542,14 @@ class DiscreteStateMarkov:
             return float(self.neighbor_positive_weight)
         return 0.0
 
-    def _cluster_boundary(self, success_scores, failure_scores):
-        """
-        Find threshold between success and failure distributions.
-        Using weighted mean instead of k-means for simplicity and stability.
-        """
-        if not success_scores and not failure_scores:
-            return float(self.optimal_threshold)
-        if not success_scores:
-            return float(np.clip(np.mean(failure_scores), 0.01, 0.99))
-        if not failure_scores:
-            return float(np.clip(np.mean(success_scores), 0.01, 0.99))
-
-        success_mean = float(np.mean(np.array(success_scores, dtype=np.float32)))
-        failure_mean = float(np.mean(np.array(failure_scores, dtype=np.float32)))
-        
-        # Weighted boundary: favor failure distribution (80%) to be more sensitive to failures
-        threshold = (success_mean * 0.8) + (failure_mean * 0.2)
-        return float(np.clip(threshold, 0.01, 0.99))
+    def _initial_label(self, mistake_step):
+        if mistake_step < 0:
+            return 0.0
+        if mistake_step == 0:
+            return 1.0
+        if mistake_step == 1:
+            return float(self.neighbor_positive_weight)
+        return 0.0
 
     def _build_history_context(self, history, step_idx, window=8):
         if not history or step_idx <= 0:
@@ -547,6 +565,8 @@ class DiscreteStateMarkov:
         return " | ".join(snippets)
 
     def get_transition_threshold(self, step_idx, total_steps, transition_key=None):
+        if transition_key == "InitialState" or step_idx == 0:
+            return float(self.initial_optimal_threshold)
         if transition_key is not None and transition_key in self.transition_thresholds:
             return float(self.transition_thresholds[transition_key])
         return float(self.optimal_threshold)
@@ -589,70 +609,132 @@ class DiscreteStateMarkov:
                 return v
 
         return ""
+
     def calibrate_risk(self, risk, agent_name):
         return float(np.clip(float(risk), 0.0, 1.0))
 
-    def optimize_threshold(self, dataset):
-        """Learn threshold from train-set score distributions."""
-        print("\nOptimizing Detection Threshold...")
-        success_scores = []
-        failure_scores = []
-        state_success_scores = defaultdict(list)
-        state_failure_scores = defaultdict(list)
+    def _simulate_detection(self, true_labels, risks):
+        if len(risks) == 0:
+            return 0.0
 
+        risks = np.array(risks)
+        true_labels = np.array(true_labels)
+
+        pred_labels = (risks >= self.optimal_threshold).astype(int)
+
+        tp = np.sum((pred_labels == 1) & (true_labels == 1))
+        fp = np.sum((pred_labels == 1) & (true_labels == 0))
+        fn = np.sum((pred_labels == 0) & (true_labels == 1))
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+        return 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+    def optimize_threshold(self, dataset):
+        from sklearn.cluster import KMeans
+        import numpy as np
+        
+        initial_probs = []
+        initial_labels = []
+        neural_probs = []
+        neural_labels = []
+
+        self.neural_risk_model.eval()
+        self.initial_risk_model.eval()
+        
         limit_files = len(dataset)
-        for idx in tqdm(range(limit_files)):
+        for idx in range(limit_files):
             json_data = dataset[idx]
             history = json_data.get('history', [])
             total_steps = len(history)
             ms = json_data.get('mistake_step', -1)
             mistake_step = int(ms) if (ms is not None and str(ms).isdigit()) else -1
             task_context = json_data.get('question', '')
+            task_type = json_data.get('task_target', '')
             system_prompts = json_data.get('system_prompt', {})
 
-            for i in range(-1, max(-1, total_steps - 1)):
-                risk, next_state, transition_key = self.get_transition_risk(
-                    task_context=task_context,
-                    history=history,
-                    step_idx=i,
-                    system_prompts=system_prompts,
-                )
+            if total_steps > 0:
+                first_role = self.normalize_agent_name(history[0].get('name', history[0].get('role', 'Unknown')))
+                if task_type not in TaskType.all():
+                    try:
+                        task_type = self.state_manager.classifier.classify_task_type(task_context)
+                    except Exception:
+                        task_type = TaskType.OTHER
+                lbl = self._initial_label(mistake_step)
+                text_info = str(history[0].get('content', ''))
+                initial_vec = self.text_extractor.encode(text_info)
+                p_err, _, _ = self.get_transition_risk(None, None, -1, is_initial=True, 
+                                                       initial_state=(task_type, first_role), initial_text=initial_vec)
+                initial_probs.append(p_err)
+                initial_labels.append(1 if lbl >= 0.5 else 0)
 
-                risk = float(risk)
-                is_failure = self._transition_label(i, mistake_step)
-                if is_failure >= 0.5:
-                    failure_scores.append(risk)
-                    state_failure_scores[transition_key].append(risk)
-                else:
-                    success_scores.append(risk)
-                    state_success_scores[transition_key].append(risk)
+            history_states = []
+            for i in range(total_steps):
+                curr_msg = history[i]
+                next_msg = history[i + 1] if i + 1 < len(history) else None
+                if next_msg is None:
+                    break
+                    
+                curr_agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
+                next_agent_name = next_msg.get('name', next_msg.get('role', 'Unknown'))
+                
+                curr_desc = self.resolve_agent_description(system_prompts, curr_agent_name)
+                next_desc = self.resolve_agent_description(system_prompts, next_agent_name)
+                
+                try:
+                    curr_history_ctx = self._build_history_context(history, i)
+                    next_history_ctx = self._build_history_context(history, i + 1)
+                    curr_state_tuple = self.state_manager.extract_state(
+                        task_context, curr_msg, curr_desc, history_context=curr_history_ctx
+                    )
+                    next_state_tuple = self.state_manager.extract_state(
+                        task_context, next_msg, next_desc, history_context=next_history_ctx
+                    )
+                except Exception:
+                    continue
+                    
+                (p_role, p_action, p_consensus, p_txt) = curr_state_tuple
+                (c_role, c_action, c_consensus, c_txt) = next_state_tuple
+                node_state = (p_action, p_consensus, c_role)
 
-                _ = next_state
+                task_context_text = self._task_context_to_text(task_context)
+                task_text_vec = self.text_extractor.encode(task_context_text)
+                prev_text_vec = self.text_extractor.encode(p_txt)
+                curr_text_vec = self.text_extractor.encode(c_txt)
+                
+                p_err, _, _ = self.get_transition_risk(task_context, history, i, transition_state=((node_state, (task_type, c_role), prev_text_vec, curr_text_vec)))
+                lbl = self._transition_label(i + 1, mistake_step)
+                
+                neural_probs.append(p_err)
+                neural_labels.append(1 if lbl >= 0.5 else 0)
 
-        self.optimal_threshold = self._cluster_boundary(success_scores, failure_scores)
-        print(
-            f"Stats: Mean Success Risk={np.mean(success_scores) if success_scores else 0.0:.4f}, "
-            f"Mean Failure Risk={np.mean(failure_scores) if failure_scores else 0.0:.4f}"
-        )
-        print(f"Selected Threshold (Cluster Boundary): {self.optimal_threshold:.4f}")
+        def get_optimal_thresh(probs, labels):
+            if not probs: return 0.5
+            pos_probs = [p for p, l in zip(probs, labels) if l == 1]
+            neg_probs = [p for p, l in zip(probs, labels) if l == 0]
+            
+            if not pos_probs or not neg_probs:
+                return np.mean(probs)
+                
+            X = np.array(probs).reshape(-1, 1)
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(X)
+            centers = sorted(kmeans.cluster_centers_.flatten())
+            return float((centers[0] + centers[1]) / 2.0)
+            
+        self.initial_optimal_threshold = get_optimal_thresh(initial_probs, initial_labels)
+        self.optimal_threshold = get_optimal_thresh(neural_probs, neural_labels)
+        
+        print(f"Optimized Initial Threshold via KMeans: {self.initial_optimal_threshold:.4f}")
+        print(f"Optimized Neural Threshold via KMeans: {self.optimal_threshold:.4f}")
 
-        # State-specific thresholds via class-conditioned cluster boundaries.
-        all_keys = set(state_success_scores.keys()) | set(state_failure_scores.keys())
-        self.transition_thresholds = {}
-        for key in all_keys:
-            success_arr = state_success_scores.get(key, [])
-            failure_arr = state_failure_scores.get(key, [])
-            if len(success_arr) + len(failure_arr) >= 6:
-                thr = self._cluster_boundary(success_arr, failure_arr)
-            else:
-                thr = float(self.optimal_threshold)
-            self.transition_thresholds[key] = thr
-        print(f"Learned State-Specific Thresholds: {len(self.transition_thresholds)}")
+        return self.optimal_threshold
 
     def fit(self, dataset):
         print("Fitting Markov + Neural model with compact state...")
         limit_files = len(dataset)
         self.training_transitions = []
+        self.training_initial_states = []
         self.transition_counts = defaultdict(int)
         self.transition_failure_sums = defaultdict(float)
         self.global_impact_sum = 0.0
@@ -676,19 +758,22 @@ class DiscreteStateMarkov:
 
                 if i == -1:
                     next_msg = history[0]
-                    next_agent_name = next_msg.get('name', next_msg.get('role', 'Unknown'))
-                    next_desc = self.resolve_agent_description(sys_prompts, next_agent_name)
-                    try:
-                        curr_state = self.state_manager.extract_task_state(task_context)
-                        next_state = self.state_manager.extract_state(
-                            task_context,
-                            next_msg,
-                            next_desc,
-                            history_context="",
-                        )
-                    except Exception:
-                        continue
-                    effective_step = -1
+                    next_agent_name = self.normalize_agent_name(next_msg.get('name', next_msg.get('role', 'Unknown')))
+                    text_info = str(next_msg.get('content', ''))
+                    initial_vec = self.text_extractor.encode(text_info)
+                    label = self._initial_label(mistake_step)
+
+                    task_type = json_data.get('task_target', TaskType.OTHER)
+                    if task_type not in TaskType.all():
+                        try:
+                            task_type = self.state_manager.classifier.classify_task_type(task_context)
+                        except Exception:
+                            task_type = TaskType.OTHER
+                        
+                    self.training_initial_states.append(
+                        ((task_type, next_agent_name), initial_vec, 1.0 if label >= 0.5 else 0.0)
+                    )
+                    continue
                 else:
                     curr_msg = history[i]
                     next_msg = history[i + 1]
@@ -760,117 +845,191 @@ class DiscreteStateMarkov:
             f"pos_weight={self.class_pos_weight:.2f}"
         )
         
-        print(f"\n[Step 2/3] Training Neural Risk Model on {len(self.training_transitions)} transitions...")
+        print(f"\n[Step 2/3] Training Models...")
+        print(f"Training Initial Risk Model on {len(self.training_initial_states)} initial states...")
+        self._train_initial_model()
+        print(f"Training Neural Risk Model on {len(self.training_transitions)} transitions...")
         self._train_neural_model()
         
         self.optimize_threshold(dataset)
 
+    def _train_initial_model(self, epochs=20, batch_size=32, lr=0.001):
+        optimizer = torch.optim.Adam(self.initial_risk_model.parameters(), lr=lr, weight_decay=1e-4)
+        best_loss = float('inf')
+        patience_counter = 0
+
+        if not self.training_initial_states:
+            print("No initial states to train.")
+            return
+
+        for epoch in range(epochs):
+            self.initial_risk_model.train()
+            epoch_loss = 0.0
+            np.random.shuffle(self.training_initial_states)
+
+            for i in range(0, len(self.training_initial_states), batch_size):
+                batch = self.training_initial_states[i:i+batch_size]
+
+                states = [b[0] for b in batch]
+                text_vecs = [b[1] for b in batch]
+                labels = [b[2] for b in batch]
+
+                optimizer.zero_grad()
+                loss = self.initial_risk_model.compute_loss(states, text_vecs, labels)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / max(1, len(self.training_initial_states) // batch_size)
+            if (epoch + 1) % 5 == 0:
+                print(f"  Initial Model Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}")
+
+        print(f"✓ Initial Risk Model trained successfully")
+        self.initial_risk_model.eval()
+
     def _train_neural_model(self, epochs=20, batch_size=32, lr=0.001):
-        """Train neural transition risk scorer."""
-        optimizer = torch.optim.Adam(self.neural_risk_model.parameters(), lr=lr)
-        transitions = self.training_transitions
-        if not transitions:
+        optimizer = torch.optim.Adam(self.neural_risk_model.parameters(), lr=lr, weight_decay=1e-4)
+
+        if not self.training_transitions:
             print("No transitions to train.")
             return
-        n_batches = max(1, math.ceil(len(transitions) / batch_size))
 
-        pos_indices = [i for i, t in enumerate(transitions) if t[4] >= 0.5]
-        neg_indices = [i for i, t in enumerate(transitions) if t[4] < 0.5]
-        
         for epoch in range(epochs):
             epoch_loss = 0.0
-            
-            for _ in range(n_batches):
-                if pos_indices and neg_indices:
-                    n_pos = min(len(pos_indices), max(1, batch_size // 2))
-                    n_neg = batch_size - n_pos
-                    pos_pick = np.random.choice(pos_indices, size=n_pos, replace=(len(pos_indices) < n_pos))
-                    neg_pick = np.random.choice(neg_indices, size=n_neg, replace=(len(neg_indices) < n_neg))
-                    batch_indices = np.concatenate([pos_pick, neg_pick])
-                    np.random.shuffle(batch_indices)
-                else:
-                    batch_indices = np.random.choice(
-                        len(transitions),
-                        size=min(batch_size, len(transitions)),
-                        replace=False,
-                    )
-                
-                node_states = [transitions[i][0] for i in batch_indices]
-                task_texts = [transitions[i][1] for i in batch_indices]
-                prev_texts = [transitions[i][2] for i in batch_indices]
-                curr_texts = [transitions[i][3] for i in batch_indices]
-                labels = [transitions[i][4] for i in batch_indices]
-                next_actions = [transitions[i][5] for i in batch_indices]
-                sample_weights = [transitions[i][6] for i in batch_indices]
-                
+            np.random.shuffle(self.training_transitions)
+
+            for i in range(0, len(self.training_transitions), batch_size):
+                batch = self.training_transitions[i:i+batch_size]
+
+                node_states = [t[0] for t in batch]
+                task_texts = [t[1] for t in batch]
+                prev_texts = [t[2] for t in batch]
+                curr_texts = [t[3] for t in batch]
+                labels = [t[4] for t in batch]
+                sample_weights = [t[6] for t in batch]
+
                 optimizer.zero_grad()
                 loss = self.neural_risk_model.compute_loss(
-                    node_states,
-                    task_texts,
-                    prev_texts,
-                    curr_texts,
-                    labels,
-                    next_actions,
-                    sample_weights=sample_weights,
-                    class_pos_weight=self.class_pos_weight,
+                    node_states, task_texts, prev_texts, curr_texts,
+                    labels, sample_weights=sample_weights
                 )
                 loss.backward()
                 optimizer.step()
-                
+
                 epoch_loss += loss.item()
-            
-            avg_loss = epoch_loss / max(n_batches, 1)
+
+            avg_loss = epoch_loss / max(1, len(self.training_transitions) // batch_size)
             if (epoch + 1) % 5 == 0:
                 print(f"  Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}")
-        
+
         print(f"✓ Neural Risk Model trained successfully\n")
         self.neural_risk_model.eval()
 
-    def get_transition_risk(self, task_context, history, step_idx, system_prompts=None):
+    def get_transition_risk(
+        self,
+        task_context,
+        history,
+        step_idx,
+        system_prompts=None,
+        is_initial=False,
+        initial_state=None,
+        initial_text=None,
+        transition_state=None,
+    ):
         if system_prompts is None:
             system_prompts = {}
+
+        # Explicit initial-state scoring path used by threshold optimization.
+        if is_initial:
+            if initial_state is None or initial_text is None:
+                return 0.0, None, "InitialState"
+            try:
+                with torch.no_grad():
+                    initial_risk = self.initial_risk_model([initial_state], [initial_text]).item()
+                return float(np.clip(initial_risk, 0.0, 1.0)), None, "InitialState"
+            except Exception:
+                return 0.0, None, "InitialState"
+
+        # Optional direct transition payload path used by threshold optimization.
+        if transition_state is not None:
+            payload = transition_state
+            if isinstance(payload, tuple) and len(payload) == 1 and isinstance(payload[0], tuple):
+                payload = payload[0]
+            if not isinstance(payload, tuple) or len(payload) != 4:
+                return 0.0, None, "NoTransition"
+
+            node_state, _curr_state_hint, prev_text_vec, curr_text_vec = payload
+            task_context_text = self._task_context_to_text(task_context)
+            task_text_vec = self.text_extractor.encode(task_context_text)
+
+            try:
+                with torch.no_grad():
+                    neural_risk = float(
+                        self.neural_risk_model.forward(
+                            node_state,
+                            task_text_vec,
+                            prev_text_vec,
+                            curr_text_vec,
+                        )
+                    )
+            except Exception:
+                neural_risk = self.global_hazard_rate
+
+            transition_hazard = self._estimate_transition_hazard(node_state)
+            mix = float(np.mean([float(neural_risk), transition_hazard]))
+            return float(np.clip(mix, 0.0, 1.0)), None, node_state
+
+        if history is None:
+            history = []
         if step_idx < -1 or step_idx >= len(history) - 1:
             return 0.0, None, "NoTransition"
 
+        # Backward-compatible initial transition path: task -> first message.
         if step_idx == -1:
             if not history:
                 return 0.0, None, "NoTransition"
             next_msg = history[0]
-            next_agent = next_msg.get('name', next_msg.get('role', 'Unknown'))
-            next_desc = self.resolve_agent_description(system_prompts, next_agent)
-            curr_state = self.state_manager.extract_task_state(task_context)
-            next_state = self.state_manager.extract_state(
-                task_context,
-                next_msg,
-                next_desc,
-                history_context="",
-            )
-        else:
-            curr_msg = history[step_idx]
-            next_msg = history[step_idx + 1]
-            curr_agent = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
-            next_agent = next_msg.get('name', next_msg.get('role', 'Unknown'))
-            curr_desc = self.resolve_agent_description(system_prompts, curr_agent)
-            next_desc = self.resolve_agent_description(system_prompts, next_agent)
+            next_agent = self.normalize_agent_name(next_msg.get('name', next_msg.get('role', 'Unknown')))
+            initial_text = self.text_extractor.encode(str(next_msg.get('content', '')))
+            task_type = next_msg.get('task_target') if isinstance(next_msg, dict) else None
+            if not task_type or task_type not in TaskType.all():
+                try:
+                    task_type = self.state_manager.classifier.classify_task_type(task_context)
+                except Exception:
+                    task_type = TaskType.OTHER
 
-            curr_ctx = self._build_history_context(history, step_idx)
-            next_ctx = self._build_history_context(history, step_idx + 1)
+            try:
+                with torch.no_grad():
+                    initial_risk = self.initial_risk_model([(task_type, next_agent)], [initial_text]).item()
+                return float(np.clip(initial_risk, 0.0, 1.0)), None, "InitialState"
+            except Exception:
+                return 0.0, None, "InitialState"
 
-            curr_state = self.state_manager.extract_state(
-                task_context,
-                curr_msg,
-                curr_desc,
-                history_context=curr_ctx,
-            )
-            next_state = self.state_manager.extract_state(
-                task_context,
-                next_msg,
-                next_desc,
-                history_context=next_ctx,
-            )
+        curr_msg = history[step_idx]
+        next_msg = history[step_idx + 1]
+        curr_agent = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
+        next_agent = next_msg.get('name', next_msg.get('role', 'Unknown'))
+        curr_desc = self.resolve_agent_description(system_prompts, curr_agent)
+        next_desc = self.resolve_agent_description(system_prompts, next_agent)
 
-        (p_role, p_action, p_consensus, p_txt) = curr_state
-        (c_role, c_action, c_consensus, c_txt) = next_state
+        curr_ctx = self._build_history_context(history, step_idx)
+        next_ctx = self._build_history_context(history, step_idx + 1)
+
+        curr_state = self.state_manager.extract_state(
+            task_context,
+            curr_msg,
+            curr_desc,
+            history_context=curr_ctx,
+        )
+        next_state = self.state_manager.extract_state(
+            task_context,
+            next_msg,
+            next_desc,
+            history_context=next_ctx,
+        )
+
+        (_p_role, p_action, p_consensus, p_txt) = curr_state
+        (c_role, _c_action, _c_consensus, c_txt) = next_state
         node_state = (p_action, p_consensus, c_role)
 
         task_context_text = self._task_context_to_text(task_context)
@@ -880,21 +1039,20 @@ class DiscreteStateMarkov:
 
         try:
             with torch.no_grad():
-                neural_logit = self.neural_risk_model.forward(
-                    node_state,
-                    task_text_vec,
-                    prev_text_vec,
-                    curr_text_vec,
+                neural_risk = float(
+                    self.neural_risk_model.forward(
+                        node_state,
+                        task_text_vec,
+                        prev_text_vec,
+                        curr_text_vec,
+                    )
                 )
-                neural_risk = float(torch.sigmoid(torch.tensor(neural_logit)).item())
         except Exception:
             neural_risk = self.global_hazard_rate
 
-        transition_key = node_state
-        transition_hazard = self._estimate_transition_hazard(transition_key)
+        transition_hazard = self._estimate_transition_hazard(node_state)
         mix = float(np.mean([float(neural_risk), transition_hazard]))
-
-        return float(np.clip(mix, 0.0, 1.0)), next_state, transition_key
+        return float(np.clip(mix, 0.0, 1.0)), next_state, node_state
 
 # --- 3. Dataset & Evaluation ---
 
@@ -1064,7 +1222,7 @@ if __name__ == "__main__":
 
     random.shuffle(all_files)
     
-    split = int(len(all_files) * 0.4)
+    split = int(len(all_files) * 0.2)
     train_files = all_files[:split]
     test_files = all_files[split:]
     

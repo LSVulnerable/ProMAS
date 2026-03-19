@@ -958,11 +958,11 @@ def run_evaluation(markov_model, dataset):
 
 if __name__ == "__main__":
     datasets_dirs = [
-        #"Who&When/Algorithm-Generated",，
+        "Who&When/Algorithm-Generated",
         #"Who&When/Hand-Crafted",
         #"datasets/mmlu",
         #"datasets/aqua",
-        "datasets/humaneval"
+        #"datasets/humaneval"
     ]
     
     all_files = []
