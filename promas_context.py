@@ -800,7 +800,8 @@ def run_evaluation(markov_model, dataset):
         "detected": 0,
         "early_detection": 0,
         "agent_hit": 0,
-        "detection_with_correct_agent": 0
+        "detection_with_correct_agent": 0,
+        "max_risk_recall": 0
     }
     
     # Track which risk level was used for detection
@@ -841,13 +842,14 @@ def run_evaluation(markov_model, dataset):
         outcome = "MISSED"
         agent_match = False
         
-        limit = min(len(history), mistake_step + 5)
-        
         prev_state = None
         has_prior_error = False
         max_observed_risk = 0.0
         
-        for i in range(limit):
+        global_max_risk = -1.0
+        global_max_risk_step = -1
+        
+        for i in range(total_steps):
             curr_msg = history[i]
             agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
             agent_description = system_prompts.get(agent_name, "")
@@ -870,6 +872,10 @@ def run_evaluation(markov_model, dataset):
             if i == mistake_step:
                 max_observed_risk = risk
             
+            if risk > global_max_risk:
+                global_max_risk = risk
+                global_max_risk_step = i
+            
             threshold = INITIAL_RISK_THRESHOLD if i == 0 else RISK_THRESHOLD
             
             # Only detect if not yet detected
@@ -884,6 +890,9 @@ def run_evaluation(markov_model, dataset):
             
             prev_state = state
         
+        if global_max_risk_step == mistake_step:
+            stats["max_risk_recall"] += 1
+            
         if detected_at != -1:
             agent_match = detected_agent == mistake_agent
             if agent_match:
@@ -926,6 +935,7 @@ def run_evaluation(markov_model, dataset):
     print(f"Early Warning: {stats['early_detection']} ({stats['early_detection']/stats['valid_cases']:.2%})")
     combined = stats['detected'] + stats['early_detection']
     print(f"Combined Recall (Exact+Early): {combined/stats['valid_cases']:.2%}")
+    print(f"Max Risk Recall (argmax == mistake_step): {stats['max_risk_recall']} ({stats['max_risk_recall']/stats['valid_cases']:.2%})")
     print(f"\nAgent Hit Rate: {stats['agent_hit']} ({stats['agent_hit']/stats['valid_cases']:.2%})")
     print(f"Detection with Correct Agent: {stats['detection_with_correct_agent']} ({stats['detection_with_correct_agent']/stats['valid_cases']:.2%})")
     print(f"Avg Detection position ratio: {np.mean(detect_ratios):.4f}")
@@ -958,9 +968,9 @@ def run_evaluation(markov_model, dataset):
 
 if __name__ == "__main__":
     datasets_dirs = [
-        "Who&When/Algorithm-Generated",
+        #"Who&When/Algorithm-Generated",
         #"Who&When/Hand-Crafted",
-        #"datasets/mmlu",
+        "datasets/mmlu",
         #"datasets/aqua",
         #"datasets/humaneval"
     ]

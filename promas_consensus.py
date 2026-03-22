@@ -73,8 +73,8 @@ class LLMStateClassifier:
     a compact trajectory state (progress + consensus).
     """
     def __init__(self, model_path="meta-llama/Meta-Llama-3.1-8B-Instruct"):
-        self.device_map = "auto"
-        self.device = "cuda:1" if torch.cuda.is_available() else "cpu"
+        self.device_map = "cuda:1"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         possible_paths = [
             "/home/ls/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots",
@@ -479,13 +479,18 @@ class InitialRiskModel(nn.Module):
         out = self.net(emb).squeeze(-1)
         return out
         
-    def compute_loss(self, states, text_vectors, labels):
+    def compute_loss(self, states, text_vectors, labels, sample_weights=None):
         risks = self.forward(states, text_vectors)
         labels_t = torch.tensor(labels, dtype=torch.float32, device=self.device)
         if risks.dim() == 0:
             risks = risks.unsqueeze(0)
             labels_t = labels_t.unsqueeze(0)
-        return nn.BCELoss()(risks, labels_t)
+            
+        loss = nn.BCELoss(reduction='none')(risks, labels_t)
+        if sample_weights is not None:
+            weights_t = torch.tensor(sample_weights, dtype=torch.float32, device=self.device)
+            loss = loss * weights_t
+        return loss.mean()
 
 class DiscreteStateMarkov:
 
@@ -532,25 +537,15 @@ class DiscreteStateMarkov:
         return float(hazard / total)
 
     def _transition_label(self, step_idx, mistake_step):
-        effective_step = step_idx + 1
         if mistake_step < 0:
             return 0.0
-        if effective_step == mistake_step:
+        if step_idx == mistake_step:
             return 1.0
         # Soft positives around the mistake step reduce extreme one-positive sparsity.
-        if abs(effective_step - mistake_step) == 1:
+        if abs(step_idx - mistake_step) == 1:
             return float(self.neighbor_positive_weight)
         return 0.0
-
-    def _initial_label(self, mistake_step):
-        if mistake_step < 0:
-            return 0.0
-        if mistake_step == 0:
-            return 1.0
-        if mistake_step == 1:
-            return float(self.neighbor_positive_weight)
-        return 0.0
-
+    
     def _build_history_context(self, history, step_idx, window=8):
         if not history or step_idx <= 0:
             return ""
@@ -567,9 +562,19 @@ class DiscreteStateMarkov:
     def get_transition_threshold(self, step_idx, total_steps, transition_key=None):
         if transition_key == "InitialState" or step_idx == 0:
             return float(self.initial_optimal_threshold)
+        
+        base_t = float(self.optimal_threshold)
+        # Dynamic Threshold: We raise the threshold slightly in early non-zero steps
+        # to prevent excessive EARLY_WARN, then taper it back down to base_t later.
+        # Max bump: +0.08 at step 1, decaying down.
+        if step_idx > 0:
+            decay_factor = max(0.0, 1.0 - (step_idx - 1) / 3.0) 
+            dynamic_bump = 0.08 * decay_factor
+            base_t = min(0.95, base_t + dynamic_bump)
+            
         if transition_key is not None and transition_key in self.transition_thresholds:
             return float(self.transition_thresholds[transition_key])
-        return float(self.optimal_threshold)
+        return base_t
 
     def normalize_agent_name(self, agent_name):
         if agent_name is None:
@@ -661,7 +666,7 @@ class DiscreteStateMarkov:
                         task_type = self.state_manager.classifier.classify_task_type(task_context)
                     except Exception:
                         task_type = TaskType.OTHER
-                lbl = self._initial_label(mistake_step)
+                lbl = 1.0 if mistake_step == 0 else 0.0
                 text_info = str(history[0].get('content', ''))
                 initial_vec = self.text_extractor.encode(text_info)
                 p_err, _, _ = self.get_transition_risk(None, None, -1, is_initial=True, 
@@ -669,7 +674,6 @@ class DiscreteStateMarkov:
                 initial_probs.append(p_err)
                 initial_labels.append(1 if lbl >= 0.5 else 0)
 
-            history_states = []
             for i in range(total_steps):
                 curr_msg = history[i]
                 next_msg = history[i + 1] if i + 1 < len(history) else None
@@ -709,24 +713,66 @@ class DiscreteStateMarkov:
                 neural_probs.append(p_err)
                 neural_labels.append(1 if lbl >= 0.5 else 0)
 
-        def get_optimal_thresh(probs, labels):
-            if not probs: return 0.5
-            pos_probs = [p for p, l in zip(probs, labels) if l == 1]
-            neg_probs = [p for p, l in zip(probs, labels) if l == 0]
+        def get_optimal_thresh(probs, labels, target_recall=0.80):
+            if not probs:
+                return 0.5
+
+            probs_arr = np.asarray(probs, dtype=np.float32)
+            labels_arr = np.asarray(labels, dtype=np.int32)
+            pos_count = int(np.sum(labels_arr == 1))
+            neg_count = int(np.sum(labels_arr == 0))
+
+            # If supervision is not informative, fall back to average score.
+            if pos_count == 0 or neg_count == 0:
+                return float(np.mean(probs_arr))
+
+            # Recall-first supervised search: force thresholds that keep recall high.
+            quantiles = np.linspace(0.01, 0.99, 197)
+            candidates = np.unique(np.quantile(probs_arr, quantiles))
+            if candidates.size == 0:
+                return float(np.mean(probs_arr))
+
+            best_t = float(np.median(probs_arr))
+            best_score = -1.0
+            recall_feasible = []
+
+            for t in candidates:
+                pred = (probs_arr >= t).astype(np.int32)
+                tp = int(np.sum((pred == 1) & (labels_arr == 1)))
+                fp = int(np.sum((pred == 1) & (labels_arr == 0)))
+                fn = int(np.sum((pred == 0) & (labels_arr == 1)))
+                tn = int(np.sum((pred == 0) & (labels_arr == 0)))
+
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+                # Score directly rewards recall and lightly penalizes false alarms.
+                score = recall - 0.15 * fpr + 0.05 * precision
+                if recall >= target_recall:
+                    recall_feasible.append((score, float(t), recall, precision))
+
+                if score > best_score:
+                    best_score = score
+                    best_t = float(t)
+
+            # If we can satisfy recall target, pick the best threshold under that regime.
+            if recall_feasible:
+                recall_feasible.sort(key=lambda x: (x[0], x[2], x[3]), reverse=True)
+                best_t = recall_feasible[0][1]
+
+            # Safety cap: avoid excessively high thresholds that cause mass MISS.
+            high_cap = float(np.quantile(probs_arr, 0.80))
+            best_t = min(best_t, high_cap)
+
+            return best_t
             
-            if not pos_probs or not neg_probs:
-                return np.mean(probs)
-                
-            X = np.array(probs).reshape(-1, 1)
-            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10).fit(X)
-            centers = sorted(kmeans.cluster_centers_.flatten())
-            return float((centers[0] + centers[1]) / 2.0)
-            
-        self.initial_optimal_threshold = get_optimal_thresh(initial_probs, initial_labels)
-        self.optimal_threshold = get_optimal_thresh(neural_probs, neural_labels)
+        self.initial_optimal_threshold = get_optimal_thresh(initial_probs, initial_labels, target_recall=0.70)
+        # Apply a step-based decay to neural threshold (dynamic relaxation)
+        self.optimal_threshold = get_optimal_thresh(neural_probs, neural_labels, target_recall=0.80)
         
-        print(f"Optimized Initial Threshold via KMeans: {self.initial_optimal_threshold:.4f}")
-        print(f"Optimized Neural Threshold via KMeans: {self.optimal_threshold:.4f}")
+        print(f"Optimized Initial Threshold (Recall-first): {self.initial_optimal_threshold:.4f}")
+        print(f"Optimized Neural Threshold (Recall-first): {self.optimal_threshold:.4f}")
 
         return self.optimal_threshold
 
@@ -752,53 +798,33 @@ class DiscreteStateMarkov:
             task_text_vec = self.text_extractor.encode(task_context_text)
             sys_prompts = json_data.get('system_prompt', {})
 
-            for i in range(-1, len(history) - 1):
-                if i == -1 and not history:
-                    continue
+            # Step 0 is handled by InitialRiskModel; transitions are from i-1 -> i.
+            for i in range(1, len(history)):
 
-                if i == -1:
-                    next_msg = history[0]
-                    next_agent_name = self.normalize_agent_name(next_msg.get('name', next_msg.get('role', 'Unknown')))
-                    text_info = str(next_msg.get('content', ''))
-                    initial_vec = self.text_extractor.encode(text_info)
-                    label = self._initial_label(mistake_step)
+                curr_msg = history[i - 1]
+                next_msg = history[i]
+                curr_agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
+                next_agent_name = next_msg.get('name', next_msg.get('role', 'Unknown'))
+                curr_desc = self.resolve_agent_description(sys_prompts, curr_agent_name)
+                next_desc = self.resolve_agent_description(sys_prompts, next_agent_name)
 
-                    task_type = json_data.get('task_target', TaskType.OTHER)
-                    if task_type not in TaskType.all():
-                        try:
-                            task_type = self.state_manager.classifier.classify_task_type(task_context)
-                        except Exception:
-                            task_type = TaskType.OTHER
-                        
-                    self.training_initial_states.append(
-                        ((task_type, next_agent_name), initial_vec, 1.0 if label >= 0.5 else 0.0)
+                try:
+                    curr_history_ctx = self._build_history_context(history, i - 1)
+                    next_history_ctx = self._build_history_context(history, i)
+                    curr_state = self.state_manager.extract_state(
+                        task_context,
+                        curr_msg,
+                        curr_desc,
+                        history_context=curr_history_ctx,
                     )
+                    next_state = self.state_manager.extract_state(
+                        task_context,
+                        next_msg,
+                        next_desc,
+                        history_context=next_history_ctx,
+                    )
+                except Exception:
                     continue
-                else:
-                    curr_msg = history[i]
-                    next_msg = history[i + 1]
-                    curr_agent_name = curr_msg.get('name', curr_msg.get('role', 'Unknown'))
-                    next_agent_name = next_msg.get('name', next_msg.get('role', 'Unknown'))
-                    curr_desc = self.resolve_agent_description(sys_prompts, curr_agent_name)
-                    next_desc = self.resolve_agent_description(sys_prompts, next_agent_name)
-
-                    try:
-                        curr_history_ctx = self._build_history_context(history, i)
-                        next_history_ctx = self._build_history_context(history, i + 1)
-                        curr_state = self.state_manager.extract_state(
-                            task_context,
-                            curr_msg,
-                            curr_desc,
-                            history_context=curr_history_ctx,
-                        )
-                        next_state = self.state_manager.extract_state(
-                            task_context,
-                            next_msg,
-                            next_desc,
-                            history_context=next_history_ctx,
-                        )
-                    except Exception:
-                        continue
                 (p_role, p_action, p_consensus, p_txt) = curr_state
                 (c_role, c_action, c_consensus, c_txt) = next_state
 
@@ -827,6 +853,20 @@ class DiscreteStateMarkov:
                     )
                 )
 
+            # Collect initial-step sample separately.
+            if total_steps > 0:
+                first_msg = history[0]
+                first_agent = self.normalize_agent_name(first_msg.get('name', first_msg.get('role', 'Unknown')))
+                first_text = self.text_extractor.encode(str(first_msg.get('content', '')))
+                task_type = json_data.get('task_target', TaskType.OTHER)
+                if task_type not in TaskType.all():
+                    try:
+                        task_type = self.state_manager.classifier.classify_task_type(task_context)
+                    except Exception:
+                        task_type = TaskType.OTHER
+                initial_label = 1.0 if mistake_step == 0 else 0.0
+                self.training_initial_states.append(((task_type, first_agent), first_text, initial_label))
+
         if self.transition_counts:
             total_hazard = float(sum(self.transition_failure_sums.values()))
             total_transitions = float(sum(self.transition_counts.values()))
@@ -840,9 +880,41 @@ class DiscreteStateMarkov:
             self.class_pos_weight = float(np.clip(hard_neg / hard_pos, 1.0, 20.0))
         else:
             self.class_pos_weight = 1.0
+            
+        # Optional: Also calculate imbalance for initial states
+        init_pos = sum(1 for t in self.training_initial_states if t[2] >= 0.5)
+        init_neg = max(1, len(self.training_initial_states) - init_pos)
+        self.initial_pos_weight = float(np.clip(init_neg / init_pos, 1.0, 10.0)) if init_pos > 0 else 1.0
+
+        # Apply class-imbalance weighting to each sample (was previously unused).
+        reweighted = []
+        for node_state, task_text_vec, prev_text_vec, curr_text_vec, label, c_action, _ in self.training_transitions:
+            # Hard positives get full pos weight; soft-neighbor positives get partial boost.
+            sample_weight = 1.0 + (self.class_pos_weight - 1.0) * float(label)
+            reweighted.append(
+                (
+                    node_state,
+                    task_text_vec,
+                    prev_text_vec,
+                    curr_text_vec,
+                    float(label),
+                    c_action,
+                    float(sample_weight),
+                )
+            )
+        self.training_transitions = reweighted
+
+        reweighted_init = []
+        for state, txt, label in self.training_initial_states:
+            w = 1.0 + (self.initial_pos_weight - 1.0) * float(label)
+            reweighted_init.append((state, txt, label, w))
+        self.training_initial_states = reweighted_init
+
         print(
             f"Class balance: hard_pos={hard_pos}, hard_neg={hard_neg}, "
-            f"pos_weight={self.class_pos_weight:.2f}"
+            f"pos_weight={self.class_pos_weight:.2f}\n"
+            f"Initial balance: pos={init_pos}, neg={init_neg}, "
+            f"pos_weight={self.initial_pos_weight:.2f}"
         )
         
         print(f"\n[Step 2/3] Training Models...")
@@ -853,7 +925,7 @@ class DiscreteStateMarkov:
         
         self.optimize_threshold(dataset)
 
-    def _train_initial_model(self, epochs=20, batch_size=32, lr=0.001):
+    def _train_initial_model(self, epochs=20, batch_size=32, lr=0.005):
         optimizer = torch.optim.Adam(self.initial_risk_model.parameters(), lr=lr, weight_decay=1e-4)
         best_loss = float('inf')
         patience_counter = 0
@@ -873,9 +945,10 @@ class DiscreteStateMarkov:
                 states = [b[0] for b in batch]
                 text_vecs = [b[1] for b in batch]
                 labels = [b[2] for b in batch]
+                weights = [b[3] for b in batch]
 
                 optimizer.zero_grad()
-                loss = self.initial_risk_model.compute_loss(states, text_vecs, labels)
+                loss = self.initial_risk_model.compute_loss(states, text_vecs, labels, sample_weights=weights)
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
@@ -887,7 +960,7 @@ class DiscreteStateMarkov:
         print(f"✓ Initial Risk Model trained successfully")
         self.initial_risk_model.eval()
 
-    def _train_neural_model(self, epochs=20, batch_size=32, lr=0.001):
+    def _train_neural_model(self, epochs=20, batch_size=32, lr=0.005):
         optimizer = torch.optim.Adam(self.neural_risk_model.parameters(), lr=lr, weight_decay=1e-4)
 
         if not self.training_transitions:
@@ -974,10 +1047,7 @@ class DiscreteStateMarkov:
                     )
             except Exception:
                 neural_risk = self.global_hazard_rate
-
-            transition_hazard = self._estimate_transition_hazard(node_state)
-            mix = float(np.mean([float(neural_risk), transition_hazard]))
-            return float(np.clip(mix, 0.0, 1.0)), None, node_state
+            return float(np.clip(neural_risk, 0.0, 1.0)), None, node_state
 
         if history is None:
             history = []
@@ -1049,10 +1119,7 @@ class DiscreteStateMarkov:
                 )
         except Exception:
             neural_risk = self.global_hazard_rate
-
-        transition_hazard = self._estimate_transition_hazard(node_state)
-        mix = float(np.mean([float(neural_risk), transition_hazard]))
-        return float(np.clip(mix, 0.0, 1.0)), next_state, node_state
+        return float(np.clip(neural_risk, 0.0, 1.0)), next_state, node_state
 
 # --- 3. Dataset & Evaluation ---
 
@@ -1111,32 +1178,55 @@ def run_evaluation(markov_model, dataset):
         max_observed_risk = 0.0
         step_records = []
 
-        # Unified loop: handle all transitions uniformly from step_idx=-1 (task->first) onwards.
-        for i in range(-1, max(-1, total_steps - 1)):
+        # Step 0: initial model risk.
+        if total_steps > 0:
+            first_msg = history[0]
+            first_agent = markov_model.normalize_agent_name(first_msg.get('name', first_msg.get('role', 'Unknown')))
+            first_text = markov_model.text_extractor.encode(str(first_msg.get('content', '')))
+            task_type = json_data.get('task_target', TaskType.OTHER)
+            if task_type not in TaskType.all():
+                try:
+                    task_type = markov_model.state_manager.classifier.classify_task_type(task_context)
+                except Exception:
+                    task_type = TaskType.OTHER
+
+            risk0, _, key0 = markov_model.get_transition_risk(
+                task_context=None,
+                history=None,
+                step_idx=-1,
+                is_initial=True,
+                initial_state=(task_type, first_agent),
+                initial_text=first_text,
+            )
+            risk0 = markov_model.calibrate_risk(risk0, first_agent)
+            step_records.append((0, first_agent, risk0))
+            if mistake_step == 0:
+                max_observed_risk = risk0
+            th0 = markov_model.get_transition_threshold(0, total_steps, transition_key=key0)
+            if detected_at == -1 and risk0 >= th0:
+                detected_at = 0
+                detected_agent = first_msg.get('name', first_msg.get('role', 'Unknown'))
+
+        # Transition steps: evaluate i-1 -> i, for i in [1, total_steps-1].
+        for i in range(1, total_steps):
             risk, next_state, transition_key = markov_model.get_transition_risk(
                 task_context=task_context,
                 history=history,
-                step_idx=i,
+                step_idx=i - 1,
                 system_prompts=system_prompts,
             )
 
-            if i == -1:
-                target_idx = 0
-                target_msg = history[0]
-            else:
-                target_idx = i + 1
-                target_msg = history[target_idx]
-            
+            target_idx = i
+            target_msg = history[target_idx]
             agent_name = target_msg.get('name', target_msg.get('role', 'Unknown'))
             risk = markov_model.calibrate_risk(risk, agent_name)
             step_records.append((target_idx, agent_name, risk))
-            
+
             if target_idx == mistake_step:
                 max_observed_risk = risk
             threshold = markov_model.get_transition_threshold(target_idx, total_steps, transition_key=transition_key)
-            
-            # Only detect if not yet detected.
-            if detected_at == -1 and risk > threshold:
+
+            if detected_at == -1 and risk >= threshold:
                 detected_at = target_idx
                 detected_agent = agent_name
 
