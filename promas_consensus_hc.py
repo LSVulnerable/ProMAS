@@ -110,9 +110,9 @@ class LLMStateClassifier:
         else:
             task_context_str = str(task_context)
 
-        content = str(history_item.get("content", "") or "")[:1200]
+        content = str(history_item.get("content", "") or "")[:2000]
         agent_name = history_item.get("name", history_item.get("role", "Unknown"))
-        context = f"Prior context: {history_context[:800]}\n" if history_context else ""
+        context = f"Prior context: {history_context[-2000:]}\n" if history_context else ""
         desc = f"Agent description: {str(agent_description)[:300]}\n" if agent_description else ""
 
         system_prompt = (
@@ -122,12 +122,13 @@ class LLMStateClassifier:
             "1) agent_role: DOER|THINKER|MANAGER|USER_PROXY|SYSTEM\n"
             "2) action_type: ACT|TOOL_CALL|PLANNING|EVALUATION|INFORMATION|OK|FAIL\n"
             "3) consensus_state: NOVEL_PROPOSAL|GROUNDED_CONSENSUS|BLIND_CONSENSUS|CRITICAL_DIVERGENCE|STUCK_LOOP\n"
+            "IMPORTANT: Pay extreme attention to the context! If the message hallucinates, gets stuck repeating, diverges from the task, or fails to find what's needed, strongly prefer CRITICAL_DIVERGENCE or STUCK_LOOP.\n"
             "JSON schema:\n"
             "{\"agent_role\":\"...\",\"action_type\":\"...\",\"consensus_state\":\"...\"}"
         )
 
         user_prompt = (
-            f"Task Context: {task_context_str[:220]}\n"
+            f"Task Context: {task_context_str[:2000]}\n"
             f"Speaker: {agent_name}\n"
             f"{desc}"
             f"{context}"
@@ -233,7 +234,7 @@ class PreDefinedStateManager:
             task_context_str = str(task_context)
         
         content_hash = hash(history_item.get('content', ''))
-        key = (task_context_str[:50], content_hash, hash(history_context[:240]))
+        key = (hash(task_context_str[:1500]), content_hash, hash(history_context))
         
         if key in self.cache:
             role, action, consensus = self.cache[key]
@@ -330,8 +331,9 @@ class NeuralRiskModel(nn.Module):
         )
 
         self.risk_head = nn.Sequential(
-            nn.Linear(hidden_dim + 6, hidden_dim),
+            nn.Linear(hidden_dim + 8, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
@@ -348,18 +350,22 @@ class NeuralRiskModel(nn.Module):
             vec = fixed
         return torch.tensor(vec, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-    def _logic_features(self, task_text, prev_text, curr_text):
+    # Note: I removed step_idx temporarily and went to memory integration using history context
+    def _logic_features(self, task_text, prev_text, curr_text, history_vec):
         task_t = self._to_text_tensor(task_text)
         prev_t = self._to_text_tensor(prev_text)
         curr_t = self._to_text_tensor(curr_text)
+        hist_t = self._to_text_tensor(history_vec)
 
         cos_sim = F.cosine_similarity(prev_t, curr_t, dim=1, eps=1e-8).unsqueeze(1)
         cos_task_prev = F.cosine_similarity(task_t, prev_t, dim=1, eps=1e-8).unsqueeze(1)
         cos_task_curr = F.cosine_similarity(task_t, curr_t, dim=1, eps=1e-8).unsqueeze(1)
+        cos_hist_curr = F.cosine_similarity(hist_t, curr_t, dim=1, eps=1e-8).unsqueeze(1)
 
         semantic_delta = torch.mean(torch.abs(curr_t - prev_t), dim=1, keepdim=True)
         task_prev_delta = torch.mean(torch.abs(task_t - prev_t), dim=1, keepdim=True)
         task_curr_delta = torch.mean(torch.abs(task_t - curr_t), dim=1, keepdim=True)
+        hist_curr_delta = torch.mean(torch.abs(hist_t - curr_t), dim=1, keepdim=True)
 
         feats = torch.cat(
             [
@@ -369,6 +375,8 @@ class NeuralRiskModel(nn.Module):
                 semantic_delta,
                 task_prev_delta,
                 task_curr_delta,
+                cos_hist_curr,
+                hist_curr_delta,
             ],
             dim=1,
         )
@@ -391,10 +399,10 @@ class NeuralRiskModel(nn.Module):
             dim=1,
         )
 
-    def forward(self, node_state, task_text, prev_text, curr_text):
+    def forward(self, node_state, task_text, prev_text, curr_text, history_vec):
         node_emb = self.encode_node_state(node_state, curr_text)
         node_encoded = self.node_encoder(node_emb)
-        logic_feats = self._logic_features(task_text, prev_text, curr_text)
+        logic_feats = self._logic_features(task_text, prev_text, curr_text, history_vec)
         combined = torch.cat([node_encoded, logic_feats], dim=1)
         risk = self.risk_head(combined)
         return risk.squeeze().item()
@@ -402,19 +410,23 @@ class NeuralRiskModel(nn.Module):
     def focal_bce_loss(self, probs, labels, sample_weights=None):
         probs = torch.clamp(probs, 1e-6, 1 - 1e-6)
         bce = F.binary_cross_entropy(probs, labels, reduction='none')
-        pt = torch.where(labels == 1, probs, 1 - probs)
-        alpha_t = torch.where(labels == 1, self.focal_alpha, 1 - self.focal_alpha)
-        focal = alpha_t * ((1 - pt) ** self.focal_gamma) * bce
+        # Corrected Focal weighting for soft labels!
+        pt_distance = torch.abs(labels - probs)
+        alpha_t = torch.where(labels >= 0.5, self.focal_alpha, 1 - self.focal_alpha)
+        focal_weight = alpha_t * (pt_distance ** self.focal_gamma)
+        
+        focal = focal_weight * bce
         if sample_weights is not None:
             focal = focal * sample_weights
         return focal.mean()
 
-    def compute_loss(self, node_states, task_texts, prev_texts, curr_texts, labels, sample_weights=None):
+    def compute_loss(self, node_states, task_texts, prev_texts, curr_texts, history_vecs, labels, sample_weights=None):
         risks = []
-        for n_state, t_txt, p_txt, c_txt in zip(node_states, task_texts, prev_texts, curr_texts):
+            
+        for n_state, t_txt, p_txt, c_txt, h_vec in zip(node_states, task_texts, prev_texts, curr_texts, history_vecs):
             node_emb = self.encode_node_state(n_state, c_txt)
             node_encoded = self.node_encoder(node_emb)
-            logic_feats = self._logic_features(t_txt, p_txt, c_txt)
+            logic_feats = self._logic_features(t_txt, p_txt, c_txt, h_vec)
             combined = torch.cat([node_encoded, logic_feats], dim=1)
             risks.append(self.risk_head(combined))
 
@@ -541,12 +553,20 @@ class DiscreteStateMarkov:
             return 0.0
         if step_idx == mistake_step:
             return 1.0
-        # Soft positives around the mistake step reduce extreme one-positive sparsity.
-        if abs(step_idx - mistake_step) == 1:
-            return float(self.neighbor_positive_weight)
-        return 0.0
+        
+        # Exponential temporal smoothing for long contexts
+        # The mistake is heavily influenced by the immediate preceding steps.
+        diff = mistake_step - step_idx
+        
+        if diff > 0:
+            # Steps BEFORE the mistake. Fast exponential decay for long texts.
+            return float(self.neighbor_positive_weight) * (0.3 ** (diff - 1))
+        else:
+            # Steps AFTER the mistake. 
+            diff_after = abs(diff)
+            return float(self.neighbor_positive_weight) * (0.2 ** (diff_after - 1))
     
-    def _build_history_context(self, history, step_idx, window=8):
+    def _build_history_context(self, history, step_idx, window=10):
         if not history or step_idx <= 0:
             return ""
         start = max(0, step_idx - window)
@@ -554,8 +574,8 @@ class DiscreteStateMarkov:
         for item in history[start:step_idx]:
             agent = item.get('name', item.get('role', 'Unknown'))
             content = str(item.get('content', '') or '').strip().replace("\n", " ")
-            if len(content) > 200:
-                content = content[:200] + "..."
+            if len(content) > 400:
+                content = content[:400] + "..."
             snippets.append(f"{agent}: {content}")
         return " | ".join(snippets)
 
@@ -699,8 +719,9 @@ class DiscreteStateMarkov:
                 task_text_vec = self.text_extractor.encode(task_context_text)
                 prev_text_vec = self.text_extractor.encode(p_txt)
                 curr_text_vec = self.text_extractor.encode(c_txt)
+                curr_history_vec = self.text_extractor.encode(curr_history_ctx)
                 
-                p_err, _, _ = self.get_transition_risk(task_context, history, i, transition_state=((node_state, (task_type, c_role), prev_text_vec, curr_text_vec)))
+                p_err, _, _ = self.get_transition_risk(task_context, history, i, transition_state=((node_state, (task_type, c_role), prev_text_vec, curr_text_vec, curr_history_vec)))
                 lbl = self._transition_label(i + 1, mistake_step)
                 
                 neural_probs.append(p_err)
@@ -741,7 +762,8 @@ class DiscreteStateMarkov:
                 fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
 
                 # Score directly rewards recall and lightly penalizes false alarms.
-                score = recall - 0.15 * fpr + 0.05 * precision
+                # Increase precision priority to reduce Early Warnings
+                score = recall - 0.5 * fpr + 0.1 * precision
                 if recall >= target_recall:
                     recall_feasible.append((score, float(t), recall, precision))
 
@@ -755,14 +777,14 @@ class DiscreteStateMarkov:
                 best_t = recall_feasible[0][1]
 
             # Safety cap: avoid excessively high thresholds that cause mass MISS.
-            high_cap = float(np.quantile(probs_arr, 0.80))
+            high_cap = float(np.quantile(probs_arr, 0.90))
             best_t = min(best_t, high_cap)
 
             return best_t
             
-        self.initial_optimal_threshold = get_optimal_thresh(initial_probs, initial_labels, target_recall=0.70)
-        # Apply a step-based decay to neural threshold (dynamic relaxation)
-        self.optimal_threshold = get_optimal_thresh(neural_probs, neural_labels, target_recall=0.80)
+        self.initial_optimal_threshold = get_optimal_thresh(initial_probs, initial_labels, target_recall=0.60)
+        # Apply a looser recall requirement on neural threshold so it doesn't trigger 50 early warnings
+        self.optimal_threshold = get_optimal_thresh(neural_probs, neural_labels, target_recall=0.70)
         
         print(f"Optimized Initial Threshold (Recall-first): {self.initial_optimal_threshold:.4f}")
         print(f"Optimized Neural Threshold (Recall-first): {self.optimal_threshold:.4f}")
@@ -843,6 +865,8 @@ class DiscreteStateMarkov:
                         float(transition_label),
                         c_action,
                         1.0,
+                        i, # step idx at index 7
+                        self.text_extractor.encode(curr_history_ctx), # history_vec at index 8
                     )
                 )
 
@@ -870,7 +894,7 @@ class DiscreteStateMarkov:
         hard_pos = sum(1 for t in self.training_transitions if t[4] >= 0.5)
         hard_neg = max(1, len(self.training_transitions) - hard_pos)
         if hard_pos > 0:
-            self.class_pos_weight = float(np.clip(hard_neg / hard_pos, 1.0, 20.0))
+            self.class_pos_weight = float(np.clip(hard_neg / hard_pos, 1.0, 3.5)) # Prevent massive False Positive imbalance
         else:
             self.class_pos_weight = 1.0
             
@@ -881,7 +905,7 @@ class DiscreteStateMarkov:
 
         # Apply class-imbalance weighting to each sample (was previously unused).
         reweighted = []
-        for node_state, task_text_vec, prev_text_vec, curr_text_vec, label, c_action, _ in self.training_transitions:
+        for node_state, task_text_vec, prev_text_vec, curr_text_vec, label, c_action, _, step_idx, history_vec in self.training_transitions:
             # Hard positives get full pos weight; soft-neighbor positives get partial boost.
             sample_weight = 1.0 + (self.class_pos_weight - 1.0) * float(label)
             reweighted.append(
@@ -893,6 +917,8 @@ class DiscreteStateMarkov:
                     float(label),
                     c_action,
                     float(sample_weight),
+                    step_idx,
+                    history_vec,
                 )
             )
         self.training_transitions = reweighted
@@ -973,11 +999,13 @@ class DiscreteStateMarkov:
                 curr_texts = [t[3] for t in batch]
                 labels = [t[4] for t in batch]
                 sample_weights = [t[6] for t in batch]
+                step_idxs = [t[7] for t in batch]
+                history_vecs = [t[8] for t in batch]
 
                 optimizer.zero_grad()
                 loss = self.neural_risk_model.compute_loss(
                     node_states, task_texts, prev_texts, curr_texts,
-                    labels, sample_weights=sample_weights
+                    history_vecs, labels, sample_weights=sample_weights
                 )
                 loss.backward()
                 optimizer.step()
@@ -1021,10 +1049,15 @@ class DiscreteStateMarkov:
             payload = transition_state
             if isinstance(payload, tuple) and len(payload) == 1 and isinstance(payload[0], tuple):
                 payload = payload[0]
-            if not isinstance(payload, tuple) or len(payload) != 4:
+            if not isinstance(payload, tuple) or len(payload) < 4:
                 return 0.0, None, "NoTransition"
 
-            node_state, _curr_state_hint, prev_text_vec, curr_text_vec = payload
+            node_state = payload[0]
+            # payload[1] is _curr_state_hint, payload[2] is prev_text_vec, payload[3] is curr_text_vec
+            prev_text_vec = payload[2]
+            curr_text_vec = payload[3]
+            curr_history_vec = payload[4] if len(payload) > 4 else prev_text_vec
+
             task_context_text = self._task_context_to_text(task_context)
             task_text_vec = self.text_extractor.encode(task_context_text)
 
@@ -1036,6 +1069,7 @@ class DiscreteStateMarkov:
                             task_text_vec,
                             prev_text_vec,
                             curr_text_vec,
+                            curr_history_vec
                         )
                     )
             except Exception:
@@ -1099,6 +1133,7 @@ class DiscreteStateMarkov:
         task_text_vec = self.text_extractor.encode(task_context_text)
         prev_text_vec = self.text_extractor.encode(p_txt)
         curr_text_vec = self.text_extractor.encode(c_txt)
+        curr_history_vec = self.text_extractor.encode(curr_ctx)
 
         try:
             with torch.no_grad():
@@ -1108,6 +1143,7 @@ class DiscreteStateMarkov:
                         task_text_vec,
                         prev_text_vec,
                         curr_text_vec,
+                        curr_history_vec
                     )
                 )
         except Exception:
